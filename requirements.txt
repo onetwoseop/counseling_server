@@ -10,6 +10,7 @@ requests>=2.32.0
 
 # Data Validation & Utils
 pydantic>=2.7.0
+pydantic-settings>=2.0.0
 numpy>=1.26.0
 
 # PyTorch (기본)

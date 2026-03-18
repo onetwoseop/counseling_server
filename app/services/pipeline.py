@@ -7,15 +7,18 @@ from ai_modules.schemas import (
 )
 from app.core.container import AIContainer
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 # CounselingPipeline
 # 역할: WebSocket에서 수신한 데이터를 버퍼링하고, AI 모델을 순서대로 호출하는 처리 파이프라인.
 
-SILENCE_THRESHOLD_SEC = 0.5   # 몇 초 침묵이면 발화 종료로 판단
-VAD_SAMPLE_RATE = 16000
-VAD_CHUNK_SAMPLES = 512       # Silero VAD 요구 chunk 크기 (32ms)
-VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 4  # float32 = 4bytes
+# config.py 세팅
+SILENCE_THRESHOLD_SEC = settings.vad_silence_threshold
+VAD_SAMPLE_RATE = settings.vad_sample_rate
+VAD_CHUNK_SAMPLES = settings.vad_chunk_samples
+VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 4 # float32 = 4bytes
 
 
 class CounselingPipeline:

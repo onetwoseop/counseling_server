@@ -3,6 +3,8 @@ from ai_modules.interfaces import (
     DummyAudioEmotionModel, DummyFaceEmotionModel, DummyLLMModel
 )
 
+from app.config import settings
+
 # 모든 AI 모델을 한곳에서 관리하는 싱글톤(서버 전체에서 딱 하나의 인스턴스만 존재) 컨테이너
 class AIContainer:
     def __init__(self): # 클래스 초기화
@@ -21,7 +23,7 @@ class AIContainer:
         self.vad.load_model()
 
         # STT (음성 -> 텍스트)
-        self.stt = FasterWhisperSTTModel(model_size="base")
+        self.stt = FasterWhisperSTTModel(model_size=settings.whisper_model_size)
         self.stt.load_model()
 
         # Emotion (음성 감정)
