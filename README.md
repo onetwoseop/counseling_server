@@ -24,15 +24,16 @@ AI 기반 실시간 상담 WebSocket 서버입니다.
 counseling_server/
 ├── app/
 │   ├── main.py                  # FastAPI 앱, WebSocket 엔드포인트
-│   ├── config.py                # 환경변수 설정 (pydantic-settings)
 │   ├── schemas.py               # WebSocket 메시지 스키마
 │   ├── core/
+│   │   ├── config.py            # 환경변수 설정 (pydantic-settings)
 │   │   └── container.py         # AI 모델 싱글턴 컨테이너
 │   └── services/
-│       ├── pipeline.py          # VAD·STT·감정·LLM 처리 파이프라인
+│       ├── audio_processor.py   # VAD 침묵 감지 + 증분 STT 워커
+│       ├── pipeline.py          # 상담 데이터 흐름 오케스트레이터
 │       └── session_manager.py   # WebSocket 연결 관리 및 데이터 라우팅
 ├── ai_modules/
-│   ├── interfaces.py            # AI 모델 구현체 (실제 + 더미)
+│   ├── interfaces.py            # AI 모델 베이스 클래스 + 구현체 (실제 + 더미)
 │   └── schemas.py               # AI 모델 입출력 스키마
 ├── tests/
 │   ├── test_pipeline.py         # 파이프라인 구조 검증 (서버 불필요)
@@ -122,6 +123,16 @@ ws://localhost:8000/ws/counseling/{client_id}
 ### 클라이언트 → 서버 메시지 형식
 
 ```json
+// 초기 상담 설정 (연결 직후 1회 전송)
+{
+  "type": "setup",
+  "data": {
+    "problem": "adhd",
+    "before_emotion": "bad",
+    "counseling_context": "집중이 안 되고 아무것도 하기 싫어요"
+  }
+}
+
 // 음성 청크
 { "type": "audio", "data": "<base64 float32 PCM 16kHz>" }
 
@@ -138,9 +149,11 @@ ws://localhost:8000/ws/counseling/{client_id}
 ### 서버 → 클라이언트 메시지 형식
 
 ```json
-{ "status": "connected",   "message": "상담실에 입장하였습니다." }
-{ "status": "processing",  "message": "답변 생성 중..." }
-{ "status": "response",    "message": "AI 상담사 응답 텍스트" }
+{ "status": "connected",          "message": "상담실에 입장하였습니다." }
+{ "status": "initial_questions",  "message": "AI가 생성한 초기 CBT 질문" }
+{ "status": "processing",         "message": "답변 생성 중..." }
+{ "status": "stt_done",           "text": "STT 변환 결과 텍스트" }
+{ "status": "response",           "message": "AI 상담사 응답 텍스트" }
 ```
 
 ---

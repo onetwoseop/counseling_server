@@ -30,8 +30,8 @@ torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # --- B. Vision (DeepFace - 얼굴 감정 인식) ---
 # deepface>=0.0.93
-# opencv-python>=4.10.0
-# tf-keras>=2.15.0  
+opencv-python>=4.10.0
+# tf-keras>=2.15.0
 
 # --- C. Audio (Whisper STT, SpeechBrain, VAD) ---
 # openai-whisper>=20231117

@@ -3,7 +3,7 @@ from ai_modules.interfaces import (
     DummyAudioEmotionModel, DummyFaceEmotionModel, DummyLLMModel
 )
 
-from app.config import settings
+from app.core.config import settings
 
 # 모든 AI 모델을 한곳에서 관리하는 싱글톤(서버 전체에서 딱 하나의 인스턴스만 존재) 컨테이너
 class AIContainer:

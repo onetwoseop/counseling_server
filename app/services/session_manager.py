@@ -134,7 +134,7 @@ class ConnectionManager:
 
                 elif input_obj.data == "END_OF_SESSION":
                     logger.info(f"[Session] {client_id} 세션 종료 신호 수신")
-                    # 세션 종료 처리 로직 추가 예정
+                    await self.disconnect(client_id)
 
             else:
                 logger.warning(f"[Session] 알 수 없는 타입: {input_obj.type}")

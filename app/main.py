@@ -41,10 +41,11 @@ async def counseling_endpoint(websocket: WebSocket, client_id: str):
 
     except WebSocketDisconnect:
         # 연결 끊기면 매니저에게 알림
-        manager.disconnect(client_id)
+        await manager.disconnect(client_id)
     except Exception as e:
         print(f"웹소캣 에러 발생: {e}")
-        manager.disconnect(client_id)                   
+        await manager.disconnect(client_id)
+        await websocket.close()                   
 
 if __name__ == "__main__":
     import uvicorn
