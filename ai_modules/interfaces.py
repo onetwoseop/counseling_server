@@ -104,6 +104,7 @@ class SileroVADModel(BaseVADModel):
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
+            trust_repo=True
         )
         self.model.eval()
         print("[VAD] Silero VAD Loaded")
