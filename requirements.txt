@@ -1,45 +1,44 @@
+# PyTorch - GPU 서버용 (CUDA 12.1 기준)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
 # ==========================================
-# [1] 현재 단계: 서버 기본 구동 및 뼈대 작업
+# Web Server & Data Utils
 # ==========================================
-# Web Server
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-dotenv>=1.0.0
 websockets>=12.0
 requests>=2.32.0
-
-# Data Validation & Utils
 pydantic>=2.7.0
 pydantic-settings>=2.0.0
 numpy>=1.26.0
 
-# PyTorch (기본)
-# 개발용: CPU 버전
-torch --index-url https://download.pytorch.org/whl/cpu
-torchaudio --index-url https://download.pytorch.org/whl/cpu
+# ==========================================
+# PyTorch (Core)
+# ==========================================
+torch
+torchaudio
 
 # ==========================================
-# [2] 미래 단계: AI 모델 구현 시 주석 해제
-# 구현 시 주석 해제 후 pip install -r requirements.txt --upgrade 명령어 실행
+# [1] LLM (대형 언어 모델 - Qwen 등)
 # ==========================================
+transformers>=4.45.0
+accelerate>=1.0.0
+peft>=0.13.0
+bitsandbytes>=0.43.0
+protobuf>=5.0.0
 
-# --- A. LLM (Qwen2-7B-Instruct) ---
-# transformers>=4.45.0
-# accelerate>=1.0.0
-# protobuf>=5.0.0
+# ==========================================
+# [2] 얼굴 감정 인식 (Facial Emotion - DeepFace 등)
+# ==========================================
+deepface>=0.0.93
+opencv-python-headless>=4.10.0
+tf-keras>=2.15.0
 
-# --- B. Vision (DeepFace - 얼굴 감정 인식) ---
-# deepface>=0.0.93
-opencv-python>=4.10.0
-# tf-keras>=2.15.0
-
-# --- C. Audio (Whisper STT, SpeechBrain, VAD) ---
-# openai-whisper>=20231117
-# speechbrain>=1.0.0
-# soundfile>=0.12.0
-faster-whisper>=1.0.0
+# ==========================================
+# [3] 오디오 인식 및 처리 (Audio/Speech - Whisper 등)
+# ==========================================
+openai-whisper>=20231117
+soundfile>=0.12.0
+librosa>=0.10.0
 ffmpeg-python>=0.2.0
-
-# --- D. Optional (성능 최적화 및 추가 기능) ---
-# peft>=0.13.0         
-# bitsandbytes>=0.43.0
