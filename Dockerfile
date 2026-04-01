@@ -10,15 +10,15 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 시스템 패키지 설치
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
     libsndfile1 \
     libgl1-mesa-glx \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
+    libglib2.0-0 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # 의존성 파일 복사 및 설치
 COPY requirements.txt .
