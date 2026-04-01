@@ -9,7 +9,8 @@ ENV PYTHONUNBUFFERED=1 \
 # 작업 디렉토리 설정
 WORKDIR /app
 
-# 시스템 패키지 설치(데비안 12)
+# 시스템 패키지 설치
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
@@ -38,4 +39,4 @@ USER appuser
 EXPOSE 8000
 
 # FastAPI 서버 실행 명령어
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
