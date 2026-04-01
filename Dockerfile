@@ -9,13 +9,13 @@ ENV PYTHONUNBUFFERED=1 \
 # 작업 디렉토리 설정
 WORKDIR /app
 
-# 시스템 패키지 설치
-RUN apt-get update --fix-missing && \
+# 시스템 패키지 설치(데비안 12)
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
     libsndfile1 \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
