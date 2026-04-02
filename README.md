@@ -1,7 +1,8 @@
 # Attune Counseling Server
 
-AI 기반 실시간 상담 WebSocket 서버입니다.
-클라이언트로부터 음성 청크와 영상 프레임을 WebSocket으로 수신하여 VAD → STT → 감정 분석 → LLM 응답 생성 파이프라인을 처리합니다.
+AI 기반 실시간 심리상담 WebSocket 서버입니다.
+클라이언트로부터 음성 청크와 영상 프레임을 WebSocket으로 수신하여
+**VAD → STT → 텍스트/음성/얼굴 감정 분석 → 감정 융합 → CBT LLM 응답 생성** 파이프라인을 처리합니다.
 
 ---
 
@@ -12,9 +13,12 @@ AI 기반 실시간 상담 WebSocket 서버입니다.
 | 언어 | Python 3.10+ |
 | 웹 프레임워크 | FastAPI + Uvicorn |
 | 음성 감지 (VAD) | Silero VAD (PyTorch) |
-| 음성 인식 (STT) | faster-whisper |
-| 감정 분석 | Dummy 모델 (추후 DeepFace / SpeechBrain 교체 예정) |
-| LLM | Dummy 모델 (추후 Qwen2 교체 예정) |
+| 음성 인식 (STT) | faster-whisper (CUDA) |
+| 텍스트 감정 | klue/bert (로컬 `models/text-emotion-final`) |
+| 음성 감정 | Wav2Vec2 (로컬 `models/voice-emotion-final`) |
+| 얼굴 감정 | DeepFace |
+| 감정 융합 | 가중치 평균 (텍스트 0.40 + 음성 0.35 + 얼굴 0.25) |
+| LLM | Qwen2.5-3B-Instruct + CBT LoRA (로컬 `models/cbt-counselor-final`) |
 
 ---
 
@@ -33,11 +37,19 @@ counseling_server/
 │       ├── pipeline.py          # 상담 데이터 흐름 오케스트레이터
 │       └── session_manager.py   # WebSocket 연결 관리 및 데이터 라우팅
 ├── ai_modules/
-│   ├── interfaces.py            # AI 모델 베이스 클래스 + 구현체 (실제 + 더미)
+│   ├── interfaces.py            # AI 모델 베이스 클래스 + 더미 구현체
+│   ├── models.py                # 실제 AI 모델 구현체 (로컬 모델 연동)
 │   └── schemas.py               # AI 모델 입출력 스키마
+├── models/                      # ⚠️ Git 제외 (팀 내부 공유) — 아래 참고
+│   ├── cbt-counselor-final/     # CBT 상담 LoRA 어댑터 (Qwen2.5-3B 기반)
+│   ├── text-emotion-final/      # 텍스트 감정 분류 (klue/bert)
+│   ├── voice-emotion-final/     # 음성 감정 분류 (Wav2Vec2)
+│   └── lora/                    # 감정별 LoRA (angry/sad/happy/fear/disgust/surprise/neutral)
 ├── tests/
 │   ├── test_pipeline.py         # 파이프라인 구조 검증 (서버 불필요)
 │   └── test_ws_client.py        # WebSocket 통합 테스트 (서버 필요, mp4 사용)
+├── Dockerfile                   # GPU 서버 배포용 (nvidia/cuda:12.4.1 베이스)
+├── docker-compose.example.yml   # Docker 구성 참고용 (실제 사용 시 복사 후 수정)
 ├── .env.example                 # 환경변수 템플릿
 ├── requirements.txt
 └── README.md
@@ -50,27 +62,46 @@ counseling_server/
 ### 1. 파이썬 가상환경 생성 및 활성화
 
 ```bash
-# 가상환경 생성
 python -m venv venv
 
-# 활성화 (Windows)
+# Windows
 venv\Scripts\activate
 
-# 활성화 (macOS / Linux)
+# macOS / Linux
 source venv/bin/activate
 ```
 
 ### 2. 의존성 설치
 
-> PyTorch는 용량이 크므로 처음 설치에 시간이 걸릴 수 있습니다.
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. 환경변수 설정
+> PyTorch (CUDA 12.4 빌드)와 AI 모델 패키지가 포함되어 있어 초기 설치에 수분이 걸릴 수 있습니다.
 
-`.env.example`을 복사해 `.env` 파일을 만들고 필요에 따라 값을 수정합니다.
+### 3. AI 모델 파일 배치
+
+`models/` 폴더는 Git에 포함되지 않습니다. 팀 내부 공유 스토리지(Google Drive 등)에서 다운로드 후 아래 구조로 배치하세요.
+
+```
+counseling_server/
+└── models/
+    ├── cbt-counselor-final/
+    ├── text-emotion-final/
+    ├── voice-emotion-final/
+    └── lora/
+        ├── angry/
+        ├── sad/
+        ├── happy/
+        ├── fear/
+        ├── disgust/
+        ├── surprise/
+        └── neutral/
+```
+
+> LLM 베이스 모델(`Qwen/Qwen2.5-3B-Instruct`)은 서버 최초 실행 시 HuggingFace에서 자동 다운로드됩니다 (~6GB).
+
+### 4. 환경변수 설정
 
 ```bash
 cp .env.example .env
@@ -80,37 +111,40 @@ cp .env.example .env
 
 | 키 | 기본값 | 설명 |
 |----|--------|------|
-| `WHISPER_MODEL_SIZE` | `base` | Whisper 모델 크기 (`tiny` / `base` / `small` / `medium` / `large`) |
-| `VAD_SILENCE_THRESHOLD` | `0.5` | 발화 종료로 판단할 침묵 시간 (초) |
+| `WHISPER_MODEL_SIZE` | `small` | Whisper 모델 크기 |
+| `WHISPER_DEVICE` | `cuda` | STT 디바이스 |
+| `CBT_LLM_USE_REAL` | `true` | CBT LLM 활성화 여부 |
+| `CBT_LLM_DEVICE` | `cuda` | LLM 디바이스 |
+| `TEXT_EMOTION_DEVICE` | `cpu` | 텍스트 감정 디바이스 |
+| `AUDIO_EMOTION_DEVICE` | `cpu` | 음성 감정 디바이스 |
+| `FACE_EMOTION_USE_REAL` | `true` | DeepFace 활성화 여부 |
 | `APP_PORT` | `8000` | 서버 포트 |
 
-### 4. 서버 실행
+> GPU 클라우드 서버에서 VRAM 여유가 있을 경우 `TEXT_EMOTION_DEVICE=cuda`, `AUDIO_EMOTION_DEVICE=cuda`로 변경 가능합니다.
+
+### 5. 서버 실행
 
 ```bash
-# 개발 모드 (코드 변경 시 자동 재시작)
-uvicorn app.main:app --reload
-
-# 특정 포트 지정
-uvicorn app.main:app --reload --port 8000
-
-# 외부 접속 허용
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+> `--reload` 옵션은 파일 변경 시 서버가 재시작되어 WebSocket 연결이 끊깁니다. 개발 중에도 사용하지 않는 것을 권장합니다.
+
 서버가 정상 실행되면 아래 메시지가 출력됩니다:
+
 ```
 >>> AI 모델 로딩을 시작합니다.....
 [VAD] Silero VAD Loaded
-[STT] faster-whisper (base) Loaded
-...
+[STT] faster-whisper (small) Loaded on cuda
+[TextEmo] 로딩 완료: models/text-emotion-final on cpu
+[VoiceEmo] Wav2Vec2 로딩 완료: models/voice-emotion-final on cpu
+[Face] DeepFace Loaded
+[CBT LLM] 로딩 완료. 감정 LoRA 로드: [angry, disgust, fear, happy, sad, surprise, neutral]
 >>> 모든 모델 로딩 완료
 INFO:     Application startup complete.
 ```
 
-서버 상태 확인:
-```
-http://localhost:8000/
-```
+서버 상태 확인: `http://localhost:8000/`
 
 ---
 
@@ -127,19 +161,20 @@ ws://localhost:8000/ws/counseling/{client_id}
 {
   "type": "setup",
   "data": {
-    "problem": "adhd",
-    "before_emotion": "bad",
-    "counseling_context": "집중이 안 되고 아무것도 하기 싫어요"
+    "topic": "직장 스트레스",
+    "mood": "anxious",
+    "content": "업무가 너무 많아서 힘들어요",
+    "style": "empathy"
   }
 }
 
-// 음성 청크
-{ "type": "audio", "data": "<base64 float32 PCM 16kHz>" }
+// 음성 청크 (webm/opus, MediaRecorder 출력 그대로)
+{ "type": "audio", "data": "<base64 webm bytes>" }
 
-// 영상 프레임
+// 영상 프레임 (JPEG)
 { "type": "video", "data": "<base64 JPEG>" }
 
-// 발화 종료 신호 (수동)
+// 발화 종료 신호
 { "type": "control", "data": "END_OF_SPEECH" }
 
 // 세션 종료
@@ -149,69 +184,76 @@ ws://localhost:8000/ws/counseling/{client_id}
 ### 서버 → 클라이언트 메시지 형식
 
 ```json
-{ "status": "connected",          "message": "상담실에 입장하였습니다." }
-{ "status": "initial_questions",  "message": "AI가 생성한 초기 CBT 질문" }
-{ "status": "processing",         "message": "답변 생성 중..." }
-{ "status": "stt_done",           "text": "STT 변환 결과 텍스트" }
-{ "status": "response",           "message": "AI 상담사 응답 텍스트" }
+{ "status": "connected",         "message": "상담실에 입장하였습니다." }
+{ "status": "initial_questions", "message": "AI가 생성한 초기 CBT 질문" }
+{ "status": "processing",        "message": "답변 생성 중..." }
+{ "status": "stt_done",          "text": "STT 변환 결과 텍스트" }
+{ "status": "response",          "message": "AI 상담사 응답 텍스트" }
 ```
+
+### 처리 흐름
+
+```
+END_OF_SPEECH 수신
+  → ffmpeg: webm/opus → float32 PCM 16kHz 변환
+  → Whisper STT → 텍스트 추출
+  → 텍스트 감정 분석 (klue/bert)
+  → 음성 감정 분석 (Wav2Vec2, PCM 사용)
+  → 얼굴 감정 평균 (누적 프레임 기반)
+  → 3모달 감정 융합 (텍스트 0.40 + 음성 0.35 + 얼굴 0.25)
+  → CBT LLM (감정 기반 LoRA 전환 → 응답 생성)
+  → response 전송
+```
+
+---
+
+## Docker 배포 (GPU 클라우드 서버)
+
+`docker-compose.example.yml`을 복사해서 사용하세요.
+
+```bash
+cp docker-compose.example.yml docker-compose.yml
+# docker-compose.yml 내용을 서버 환경에 맞게 수정
+
+# NVIDIA Container Toolkit 설치 필요 (1회)
+# sudo apt install nvidia-container-toolkit
+
+docker compose up --build -d
+```
+
+> `Dockerfile`은 `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04` 베이스 이미지를 사용합니다.
+> CUDA 버전이 다른 서버라면 Dockerfile 첫 줄의 태그를 변경하세요.
 
 ---
 
 ## 테스트
 
-### test_pipeline.py — 파이프라인 구조 검증
-
-서버 실행 없이 더미 데이터로 전체 파이프라인 흐름(모델 로딩 → 얼굴 감정 → 오디오 버퍼링 → STT → LLM 응답)을 검증합니다.
+### test_pipeline.py — 파이프라인 구조 검증 (서버 불필요)
 
 ```bash
-cd counseling_server
 python -m tests.test_pipeline
 ```
 
-정상 출력 예시:
-```
-STEP 0  AI 모델 로딩 (Dummy)
-STEP 1  이미지 프레임 3개 → 얼굴 감정 분석
-STEP 2  오디오 청크 수신 (발화 중 시뮬레이션)
-STEP 3  END_OF_SPEECH → STT + 음성 감정 추출
-STEP 4-5  END_OF_SESSION → 감정 종합 → LLM 응답 생성
-전체 파이프라인 구조 검증 완료
-```
+### test_ws_client.py — WebSocket 통합 테스트 (서버 필요)
 
----
-
-### test_ws_client.py — WebSocket 통합 테스트
-
-실제 mp4 파일에서 오디오/영상을 추출해 WebSocket으로 서버에 전송하는 통합 테스트입니다.
-**서버가 먼저 실행 중이어야 합니다.**
-
-**사전 준비:** `test_files/test_video1.mp4` 파일이 필요합니다.
+`test_files/test_video1.mp4` 파일이 필요합니다.
 
 ```bash
-# 터미널 1 — 서버 실행
-uvicorn app.main:app --reload
+# 터미널 1
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-# 터미널 2 — 테스트 실행
-cd counseling_server
+# 터미널 2
 python -m tests.test_ws_client
 ```
 
-동작 방식:
-- mp4에서 오디오를 `float32 PCM 16kHz` 로 변환 후 `32ms` 단위 청크로 전송
-- `90프레임(약 3초)` 마다 영상 프레임 1장을 JPEG로 변환하여 전송
-- `15초` 마다 `END_OF_SPEECH` 신호를 보내 STT + LLM 응답 수신 대기
-- 추출된 프레임은 `temp_frames/` 폴더에 저장되어 육안 확인 가능
-
 ---
 
-## AI 모델 교체 가이드
+## VRAM 사용량 참고 (GTX 1660 Super 6GB 기준)
 
-현재 더미 모델로 동작하는 항목은 `ai_modules/interfaces.py`에서 실제 모델 클래스로 교체할 수 있습니다.
-`requirements.txt`의 주석 처리된 패키지를 함께 해제하세요.
-
-| 모듈 | 현재 | 교체 대상 |
-|------|------|-----------|
-| 음성 감정 | `DummyAudioEmotionModel` | SpeechBrain |
-| 얼굴 감정 | `DummyFaceEmotionModel` | DeepFace |
-| LLM | `DummyLLMModel` | Qwen2-7B-Instruct |
+| 모델 | 디바이스 | 사용량 |
+|------|----------|--------|
+| Whisper small | CUDA | ~0.5GB |
+| Qwen2.5-3B (8bit 양자화) | CUDA | ~3.5GB |
+| 텍스트 감정 (BERT) | CPU | - |
+| 음성 감정 (Wav2Vec2) | CPU | - |
+| **합계** | | **~4.0GB** |

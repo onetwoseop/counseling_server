@@ -40,12 +40,12 @@ class FaceInput(BaseModel):
 # --- 4. LLM (상담 생성) ---
 class LLMContext(BaseModel):
     user_text: str
-    #
     #counseling_setup: Optional[CounselingSetup] = None
     face_emotions: List[EmotionResult] = []
     voice_emotions: List[EmotionResult] = []
-    text_emotion: Optional[str] = None
-    history: List[Dict[str, str]] = []  # [ {"content": "..."}, ...]
+    text_emotion: Optional[str] = None    # STT 텍스트 감정 (primary label)
+    fused_emotion: Optional[str] = None   # 3모달 융합 최종 감정 → LoRA 선택에 사용
+    history: List[Dict[str, str]] = []    # [{"role": "user"|"assistant", "content": "..."}]
 
 class LLMResponse(BaseModel):
     reply_text: str

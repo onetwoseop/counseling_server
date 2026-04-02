@@ -9,6 +9,13 @@ __pycache__/
 # 환경변수 (절대 올리면 안 됨)
 .env
 
+# AI 모델 파일 (수GB 바이너리, 사내 파인튜닝 모델 포함)
+models/
+
+# HuggingFace / SpeechBrain 다운로드 캐시
+tmp/
+*.cache
+
 # 테스트용 미디어 파일
 test_files/
 temp_frames/
