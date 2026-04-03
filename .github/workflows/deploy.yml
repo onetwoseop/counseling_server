@@ -32,6 +32,7 @@ jobs:
         host: ${{ secrets.EC2_HOST }}
         username: ubuntu
         key: ${{ secrets.EC2_SSH_KEY }}
+        command_timeout: 30m
         script: |
           sudo docker pull ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
           sudo docker stop attune-server || true
