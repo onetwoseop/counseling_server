@@ -25,6 +25,8 @@ jobs:
         context: .
         push: true
         tags: ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
+        cache-from: type=gha
+        cache-to: type=gha, mode=max
 
     - name: 4. EC2 서버 접속해서 새 컨테이너 띄우기
       uses: appleboy/ssh-action@v1.0.3
@@ -37,9 +39,8 @@ jobs:
           sudo docker pull ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
           sudo docker stop attune-server || true
           sudo docker rm attune-server || true
-          sudo docker run -d -p 8000:8000 --name attune-server ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
           sudo docker run -d -p 8000:8000 \
             --gpus all \
             -v /home/ubuntu/models:/app/models \
             --name attune-server \
-            greenpig759/attune-api:latest 
+            ${{ secrets.DOCKER_USERNAME }}/attune-api:latest 
