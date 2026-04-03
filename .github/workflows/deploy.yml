@@ -1,5 +1,5 @@
 name: FastAPI Auto Deploy
-uses: docker/setup-buildx-action@v3
+
 
 on:
   push:
@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+    - name: Docker Buildx 최신화
+      uses: docker/setup-buildx-action@v3
+
     - name: 1. 내 코드 가져오기 (Checkout)
       uses: actions/checkout@v4
 
