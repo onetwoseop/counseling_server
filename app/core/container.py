@@ -21,7 +21,7 @@ class AIContainer:
         self.llm = None
 
     def load_models(self):
-        print(">>> AI 모델 로딩을 시작합니다.....")
+        print(">>> 컨테이너 모델 로딩.....")
 
         self.vad = SileroVADModel(speech_threshold=settings.vad_speech_threshold)
         self.vad.load_model()

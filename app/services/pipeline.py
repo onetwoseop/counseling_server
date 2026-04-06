@@ -26,8 +26,10 @@ class CounselingPipeline:
         self._face_emotion_buffer: Dict[str, List[EmotionResult]] = {}
         self._voice_emotion_buffer: Dict[str, List[EmotionResult]] = {}
         self._stt_text_buffer: Dict[str, List[str]] = {}
-        # 브라우저 webm/opus 청크를 그대로 누적 (END_OF_SPEECH 시 배치 변환)
+        # 브라우저 webm/opus 청크 누적 (배치 STT 폴백용)
         self._raw_audio_buffer: Dict[str, bytearray] = {}
+        # 청크별 실시간 STT 누적 텍스트
+        self._chunk_stt_text: Dict[str, str] = {}
         # 대화 히스토리 (멀티턴): [{"role": "user"|"assistant", "content": "..."}]
         self._conversation_history: Dict[str, List[Dict[str, str]]] = {}
         # webm→PCM 변환 후 저장 (음성 감정 분석용)
@@ -42,6 +44,7 @@ class CounselingPipeline:
         self._voice_emotion_buffer[session_id] = []
         self._stt_text_buffer[session_id] = []
         self._raw_audio_buffer[session_id] = bytearray()
+        self._chunk_stt_text[session_id] = ""
         self._conversation_history[session_id] = []
         self._last_pcm_audio[session_id] = b""
         logger.info(f"세션 초기화: {session_id}")
@@ -54,31 +57,31 @@ class CounselingPipeline:
             self._voice_emotion_buffer,
             self._stt_text_buffer,
             self._raw_audio_buffer,
+            self._chunk_stt_text,
             self._conversation_history,
             self._last_pcm_audio,
         ):
             buf.pop(session_id, None)
         logger.info(f"세션 정리: {session_id}")
 
+    # 실시간 오디오 처리를 위한 stt 백그라운드 실행 (지금 안 씀)
     async def start_transcription_worker(self, session_id: str) -> None:
         await self.audio.start_worker(session_id)
 
     # 초기 상담 설정 저장
-    def setup_counseling(self, session_id: str, topic: str, mood: str, content: str, style: str = None) -> None:
+    def setup_counseling(self, session_id: str, topic: str, mood: str, content: str) -> None:
         self._counseling_setup[session_id] = CounselingSetup(
             topic=topic,
             mood=mood,
-            content=content,
-            style=style
+            content=content
         )
         logger.info(f"[Setup] {session_id}: topic={topic} / mood={mood}")
 
     # 초기 CBT 질문 생성 (setup 데이터 → LLM → 초기 질문 반환)
-    # TODO: AI 개발자 - LLMContext.user_text 대신 CounselingSetup을 직접 활용하는 방식으로 교체 예정
     def generate_initial_questions(self, session_id: str) -> Optional[LLMResponse]:
         setup = self._counseling_setup.get(session_id)
         if not setup:
-            logger.warning(f"[InitialQ] {session_id}: 초기 설정 없음, 건너뜀")
+            logger.warning(f"[InitialQ] {session_id}: 초기 설정 없음")
             return None
         setup_text = f"주제: {setup.topic}, 기분: {setup.mood}, 내용: {setup.content}"
         llm_context = LLMContext(user_text=setup_text)
@@ -99,12 +102,48 @@ class CounselingPipeline:
     def append_audio_chunk(self, session_id: str, chunk: bytes) -> bool:
         return self.audio.append_chunk(session_id, chunk)
 
-    # 브라우저 webm/opus 청크 누적 (END_OF_SPEECH 시 배치 STT 처리)
+    # 브라우저 webm/opus 청크 누적 (배치 STT 폴백용)
     def append_raw_audio_chunk(self, session_id: str, chunk: bytes) -> None:
         if session_id in self._raw_audio_buffer:
             self._raw_audio_buffer[session_id].extend(chunk)
 
-    # webm 누적 버퍼 → ffmpeg PCM 변환 → Whisper 배치 STT
+    # webm 청크 1개 → ffmpeg PCM 변환 → Whisper STT + 음성 감정 추출 → 각 버퍼 누적
+    async def transcribe_audio_chunk(self, session_id: str, chunk: bytes) -> None:
+        if len(chunk) < 2000 or session_id not in self._chunk_stt_text:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            audio_array = await loop.run_in_executor(None, webm_to_float32_pcm, chunk)
+            if audio_array.size < 100:
+                return
+            pcm_bytes = audio_array.tobytes()
+            self._last_pcm_audio[session_id] = pcm_bytes
+            stt_input = STTInput(audio_data=pcm_bytes)
+
+            # STT
+            result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
+            if result.text.strip():
+                self._chunk_stt_text[session_id] = (
+                    self._chunk_stt_text[session_id] + " " + result.text.strip()
+                ).strip()
+                logger.info(f"[ChunkSTT] {session_id}: +'{result.text.strip()}' → 누적: '{self._chunk_stt_text[session_id]}'")
+
+            # 음성 감정 추출 → 버퍼 누적
+            try:
+                voice_emotion = await loop.run_in_executor(
+                    None, self.container.audio_emotion.analyze, stt_input
+                )
+                if session_id in self._voice_emotion_buffer:
+                    self._voice_emotion_buffer[session_id].append(voice_emotion)
+                    logger.info(f"[ChunkVoiceEmo] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
+            except Exception as e:
+                logger.error(f"[ChunkVoiceEmo] {session_id}: 오류: {e}")
+
+        except Exception as e:
+            logger.error(f"[ChunkSTT] {session_id}: 오류: {e}")
+
+    # webm 누적 버퍼 → ffmpeg PCM 변환 → Whisper 배치 STT (폴백용)
+    # transcribe_audio_chunk()에서 모든 청크가 2000바이트 미만이라 스킵되어 _chunk_stt_text가 완전히 비어있을 때 사용
     async def _transcribe_raw_audio(self, session_id: str) -> Optional[STTOutput]:
         raw = bytes(self._raw_audio_buffer.get(session_id, bytearray()))
         if len(raw) < 2000:
@@ -142,9 +181,16 @@ class CounselingPipeline:
         # 1. 증분 STT 결과 대기 (VAD 기반 - float32 PCM 입력 시 동작)
         accumulated = await self.audio.wait_and_get_text(session_id)
 
-        # 2. 증분 STT 결과가 없으면 → raw webm 버퍼 배치 STT 시도
+        # 2. 청크별 실시간 STT 누적 텍스트 사용
         if not accumulated:
-            logger.info(f"[SpeechEnd] {session_id}: 증분 STT 없음 → 배치 STT 시도 (webm→PCM)")
+            accumulated = self._chunk_stt_text.get(session_id, "").strip()
+            self._chunk_stt_text[session_id] = ""
+            if accumulated:
+                logger.info(f"[SpeechEnd] {session_id}: 청크 STT 누적 텍스트 사용: '{accumulated}'")
+
+        # 3. 폴백: 전체 버퍼 배치 STT
+        if not accumulated:
+            logger.info(f"[SpeechEnd] {session_id}: 청크 STT 없음 → 배치 STT 폴백 (webm→PCM)")
             raw_result = await self._transcribe_raw_audio(session_id)
             if raw_result and raw_result.text.strip():
                 accumulated = raw_result.text.strip()
@@ -157,22 +203,6 @@ class CounselingPipeline:
 
         self._stt_text_buffer[session_id].append(accumulated)
         logger.info(f"[SpeechEnd] {session_id}: 최종 텍스트 = '{accumulated}'")
-
-        # 음성 감정 - VAD 스냅샷 우선, 없으면 webm→PCM 변환 결과 사용
-        audio_for_emotion = self.audio.get_last_audio_snapshot(session_id)
-        if not audio_for_emotion:
-            audio_for_emotion = self._last_pcm_audio.get(session_id, b"")
-        if audio_for_emotion:
-            loop = asyncio.get_event_loop()
-            try:
-                voice_emotion = await loop.run_in_executor(
-                    None, self.container.audio_emotion.analyze, STTInput(audio_data=audio_for_emotion)
-                )
-                if session_id in self._voice_emotion_buffer:
-                    self._voice_emotion_buffer[session_id].append(voice_emotion)
-                logger.info(f"[VoiceEmotion] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
-            except Exception as e:
-                logger.error(f"[VoiceEmotion] {session_id}: 오류: {e}")
 
         return STTOutput(text=accumulated, language="ko")
 
@@ -194,7 +224,7 @@ class CounselingPipeline:
         return EmotionResult(primary_emotion=primary, probabilities=prob_dict)
 
     # STT 누적 텍스트 + 3모달 감정 융합 + 히스토리 → LLM 응답 생성
-    def generate_response(self, session_id: str) -> Optional[LLMResponse]:
+    async def generate_response(self, session_id: str) -> Optional[LLMResponse]:
         accumulated_text = " ".join(self._stt_text_buffer.get(session_id, []))
         if not accumulated_text:
             logger.warning(f"[Generate] {session_id}: 누적 텍스트 없음, 건너뜀")
@@ -203,10 +233,13 @@ class CounselingPipeline:
         face_emotions = self._face_emotion_buffer.get(session_id, [])
         voice_emotions = self._voice_emotion_buffer.get(session_id, [])
         history = self._conversation_history.get(session_id, [])
+        loop = asyncio.get_event_loop()
 
-        # ── 텍스트 감정 분석 ──────────────────────────────────
+        # ── 텍스트 감정 분석 (run_in_executor → 이벤트 루프 비점유) ──
         try:
-            text_emo = self.container.text_emotion.analyze(accumulated_text)
+            text_emo = await loop.run_in_executor(
+                None, self.container.text_emotion.analyze, accumulated_text
+            )
             logger.info(f"[TextEmo] {session_id}: {text_emo.primary_emotion} {text_emo.probabilities}")
         except Exception as e:
             logger.error(f"[TextEmo] {session_id}: 오류: {e}")
@@ -237,10 +270,9 @@ class CounselingPipeline:
         # 첫 번째 턴에만 [상담 설정] 접두어 포함
         setup = self._counseling_setup.get(session_id)
         if setup and not history:
-            style_text = f" / 상담 방식: {setup.style}" if setup.style else ""
             context_prefix = (
                 f"[상담 설정] 주제: {setup.topic} / 기분: {setup.mood}"
-                f" / 내용: {setup.content}{style_text}\n\n"
+                f" / 내용: {setup.content}\n\n"
                 f"[사용자 발화] "
             )
             full_text = context_prefix + accumulated_text
@@ -255,7 +287,10 @@ class CounselingPipeline:
             fused_emotion=fused_emo.primary_emotion,
             history=history,
         )
-        response = self.container.llm.generate_response(llm_context)
+        # LLM 추론 (run_in_executor → GPU 연산 중에도 이벤트 루프 유지)
+        response = await loop.run_in_executor(
+            None, self.container.llm.generate_response, llm_context
+        )
         logger.info(f"[LLM] {session_id}: '{response.reply_text}'")
         if response.suggested_action:
             logger.info(f"[LLM] 추천 행동: '{response.suggested_action}'")

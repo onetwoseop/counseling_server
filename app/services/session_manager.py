@@ -46,7 +46,7 @@ class ConnectionManager:
             self._video_counts.pop(client_id, None)
             logger.info(f"[Session] {client_id} 연결 해제")
 
-    # 특정 사용자에게 JSON 변환 메시지 전송 (연결 끊김은 조용히 무시)
+    # JSON 변환 메시지 전송을 위한 함수 (오류나 예외 상황에 의한 연결 끊김은 조용히 무시)
     async def send_personal_message(self, message: dict, client_id: str):
         if client_id not in self.active_connections:
             return
@@ -70,7 +70,7 @@ class ConnectionManager:
         )
 
         # LLM 응답 생성 및 전송
-        llm_response = pipeline.generate_response(client_id)
+        llm_response = await pipeline.generate_response(client_id)
         if llm_response:
             await self.send_personal_message(
                 {"status": "response", "message": llm_response.reply_text},
@@ -94,7 +94,6 @@ class ConnectionManager:
                     topic=d["topic"],
                     mood=d["mood"],
                     content=d["content"],
-                    style=d.get("style")
                 )
                 initial_response = pipeline.generate_initial_questions(client_id)
                 if initial_response:
@@ -113,6 +112,7 @@ class ConnectionManager:
                         base64_data = base64_data.split(",")[1]
                     raw_bytes = base64.b64decode(base64_data)
                     pipeline.append_raw_audio_chunk(client_id, raw_bytes)
+                    asyncio.create_task(pipeline.transcribe_audio_chunk(client_id, raw_bytes))
                     self._audio_counts[client_id] = self._audio_counts.get(client_id, 0) + 1
                     count = self._audio_counts[client_id]
                     # 50청크마다 수신 현황 로그 (100ms×50 = 5초마다)

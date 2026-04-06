@@ -9,7 +9,6 @@ class CounselingSetup(BaseModel):
     topic: str            # 상담 주제 (예: "직장 스트레스", "불면증 케어")
     mood: str             # 현재 기분 (예: "happy", "sad", "anxious")
     content: str          # 상담 내용 자유 입력 텍스트
-    style: Optional[str] = None  # 상담 방식 (예: "empathy")
 
 # --- 공통 결과 포맷 ---
 class EmotionResult(BaseModel):
