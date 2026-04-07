@@ -1,11 +1,11 @@
 import asyncio
 import logging
+import numpy as np
 from typing import Dict, List, Optional
 
 from ai_modules.schemas import (
     CounselingSetup, EmotionResult, FaceInput, LLMContext, LLMResponse, STTInput, STTOutput
 )
-from ai_modules.interfaces import webm_to_float32_pcm
 from app.core.container import AIContainer
 from app.services.audio_processor import AudioProcessor
 
@@ -83,6 +83,9 @@ class CounselingPipeline:
         if not setup:
             logger.warning(f"[InitialQ] {session_id}: 초기 설정 없음")
             return None
+        if self.container.llm is None:
+            logger.warning(f"[InitialQ] {session_id}: LLM 미로딩, 건너뜀")
+            return None
         setup_text = f"주제: {setup.topic}, 기분: {setup.mood}, 내용: {setup.content}"
         llm_context = LLMContext(user_text=setup_text)
         response = self.container.llm.generate_response(llm_context)
@@ -102,18 +105,18 @@ class CounselingPipeline:
     def append_audio_chunk(self, session_id: str, chunk: bytes) -> bool:
         return self.audio.append_chunk(session_id, chunk)
 
-    # 브라우저 webm/opus 청크 누적 (배치 STT 폴백용)
+    # 16kHz Float32 PCM 청크 누적
     def append_raw_audio_chunk(self, session_id: str, chunk: bytes) -> None:
         if session_id in self._raw_audio_buffer:
             self._raw_audio_buffer[session_id].extend(chunk)
 
-    # webm 청크 1개 → ffmpeg PCM 변환 → Whisper STT + 음성 감정 추출 → 각 버퍼 누적
+    # Float32 PCM 청크 → numpy → Whisper STT + 음성 감정 추출
     async def transcribe_audio_chunk(self, session_id: str, chunk: bytes) -> None:
         if len(chunk) < 2000 or session_id not in self._chunk_stt_text:
             return
         try:
             loop = asyncio.get_event_loop()
-            audio_array = await loop.run_in_executor(None, webm_to_float32_pcm, chunk)
+            audio_array = np.frombuffer(chunk, dtype=np.float32)
             if audio_array.size < 100:
                 return
             pcm_bytes = audio_array.tobytes()
@@ -122,6 +125,9 @@ class CounselingPipeline:
 
             # STT
             result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
+            # await 도중 세션이 정리됐을 수 있으므로 재확인
+            if session_id not in self._chunk_stt_text:
+                return
             if result.text.strip():
                 self._chunk_stt_text[session_id] = (
                     self._chunk_stt_text[session_id] + " " + result.text.strip()
@@ -142,17 +148,17 @@ class CounselingPipeline:
         except Exception as e:
             logger.error(f"[ChunkSTT] {session_id}: 오류: {e}")
 
-    # webm 누적 버퍼 → ffmpeg PCM 변환 → Whisper 배치 STT (폴백용)
-    # transcribe_audio_chunk()에서 모든 청크가 2000바이트 미만이라 스킵되어 _chunk_stt_text가 완전히 비어있을 때 사용
+    # PCM 누적 버퍼 → Whisper 배치 STT (폴백용)
+    # transcribe_pcm_chunk()에서 모든 청크가 2000바이트 미만이라 스킵되어 _chunk_stt_text가 완전히 비어있을 때 사용
     async def _transcribe_raw_audio(self, session_id: str) -> Optional[STTOutput]:
         raw = bytes(self._raw_audio_buffer.get(session_id, bytearray()))
         if len(raw) < 2000:
             logger.warning(f"[RawSTT] {session_id}: 버퍼 너무 작음 ({len(raw)}B), 건너뜀")
             return None
         try:
-            logger.info(f"[RawSTT] {session_id}: ffmpeg 변환 시작 ({len(raw)}B webm/opus)")
+            logger.info(f"[RawSTT] {session_id}: PCM 변환 시작 ({len(raw)}B)")
             loop = asyncio.get_event_loop()
-            audio_array = await loop.run_in_executor(None, webm_to_float32_pcm, raw)
+            audio_array = np.frombuffer(raw, dtype=np.float32)
             if audio_array.size < 100:
                 logger.warning(f"[RawSTT] {session_id}: PCM 변환 결과 너무 짧음")
                 return None

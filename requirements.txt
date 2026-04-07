@@ -13,11 +13,6 @@ pydantic>=2.7.0
 pydantic-settings>=2.0.0
 numpy>=1.26.0
 
-# ==========================================
-# PyTorch (Core)
-# ==========================================
-torch
-torchaudio
 
 # ==========================================
 # [1] LLM (대형 언어 모델 - Qwen 등)
@@ -42,4 +37,3 @@ tf-keras>=2.15.0
 faster-whisper>=1.0.0
 soundfile>=0.12.0
 librosa>=0.10.0
-ffmpeg-python>=0.2.0
