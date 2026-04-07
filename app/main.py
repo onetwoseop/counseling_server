@@ -35,26 +35,26 @@ async def health_check():
     )
 
 # 웹소켓 엔드포인트
-@app.websocket("/ws/counseling/{client_id}")
-async def counseling_endpoint(websocket: WebSocket, client_id: str):
+@app.websocket("/ws/counseling/{ticket_id}")
+async def counseling_endpoint(websocket: WebSocket, ticket_id: str):
     try:
         # [초기 생성] 연결 요청 처리 (connect 안에서도 끊길 수 있으므로 try 안에 포함)
-        await manager.connect(websocket, client_id)
+        await manager.connect(websocket, ticket_id)
 
         # [실시간 파이프라인] 무한 루프로 데이터 대기
         while True:
             message = await websocket.receive()
 
-            if "text" in message:
-                await manager.process_text_data(client_id, message["text"])
-            elif "bytes" in message:
-                await manager.process_binary_data(client_id, message["bytes"])
+            if message.get("text") is not None:
+                await manager.process_text_data(ticket_id, message["text"])
+            elif message.get("bytes") is not None:
+                await manager.process_binary_data(ticket_id, message["bytes"])
 
     except WebSocketDisconnect:
-        await manager.disconnect(client_id)
+        await manager.disconnect(ticket_id)
     except Exception as e:
         print(f"웹소켓 에러 발생: {e}")
-        await manager.disconnect(client_id)
+        await manager.disconnect(ticket_id)
 
 if __name__ == "__main__":
     import uvicorn
