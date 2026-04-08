@@ -107,7 +107,7 @@ class CounselingPipeline:
             )
         return response
 
-    # 오디오 청크 → VAD 필터 → STT 큐 (AudioProcessor에 위임)
+    # 오디오 청크 → VAD 필터 → 음성 구간만 _audio_buffers에 누적 (AudioProcessor에 위임)
     def append_audio_chunk(self, session_id: str, chunk: bytes) -> bool:
         return self.audio.append_chunk(session_id, chunk)
 
@@ -183,19 +183,21 @@ class CounselingPipeline:
         logger.info(f"[Face] {session_id}: {result.primary_emotion} {result.probabilities}")
         return result
 
-    # 발화 종료 → STT 완료 대기 → 음성 감정 백그라운드 시작 → 결과 반환
+    # 발화 종료 → VAD 누적 음성 일괄 STT → 음성 감정 백그라운드 시작 → 결과 반환
     async def on_speech_end(self, session_id: str) -> Optional[STTOutput]:
-        # 1. VAD 필터링된 증분 STT 결과 대기 (주 경로)
+        # 1. VAD 누적 음성 일괄 STT 처리 (주 경로)
         accumulated = await self.audio.wait_and_get_text(session_id)
 
-        # 2. 폴백: VAD 결과 없을 때 청크별 직접 STT 누적 텍스트 사용
+        # 2. 폴백: VAD 음성 없을 때 청크별 직접 STT 누적 텍스트 사용
+        # (transcribe_audio_chunk가 호출된 경우에만 유효, 현재 미사용 경로)
         if not accumulated:
             accumulated = self._chunk_stt_text.get(session_id, "").strip()
             self._chunk_stt_text[session_id] = ""
             if accumulated:
                 logger.info(f"[SpeechEnd] {session_id}: 청크 STT 누적 텍스트 사용: '{accumulated}'")
 
-        # 3. 폴백: 전체 버퍼 배치 STT
+        # 3. 폴백: PCM 누적 버퍼 배치 STT
+        # (append_raw_audio_chunk가 호출된 경우에만 유효, 현재 미사용 경로)
         if not accumulated:
             logger.info(f"[SpeechEnd] {session_id}: 청크 STT 없음 → 배치 STT 폴백")
             raw_result = await self._transcribe_raw_audio(session_id)

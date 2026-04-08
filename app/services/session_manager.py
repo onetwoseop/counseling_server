@@ -25,7 +25,7 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections[ticket_id] = websocket
         pipeline.init_session(ticket_id)
-        await pipeline.start_transcription_worker(ticket_id)
+        await pipeline.start_transcription_worker(ticket_id)  # 증분 STT 워커 (현재 미사용, 향후 전환 대비)
         self._audio_counts[ticket_id] = 0
         self._video_counts[ticket_id] = 0
         # 연결 성공 로깅으로 바꿈
@@ -57,7 +57,7 @@ class ConnectionManager:
             # WebSocketDisconnect, ClientDisconnected 등 모두 조용히 처리
             await self.disconnect(ticket_id)
 
-    # STT + LLM 백그라운드 처리 → 완료 시 클라이언트에 결과 전송
+    # VAD 누적 음성 일괄 STT → 음성 감정(백그라운드) + LLM 처리 → 완료 시 클라이언트에 결과 전송
     async def _process_speech_end(self, ticket_id: str):
         stt_result = await pipeline.on_speech_end(ticket_id)
         if not stt_result:
@@ -104,10 +104,10 @@ class ConnectionManager:
                 if input_obj.data == "END_OF_SPEECH": # 발화 종료
                     a = self._audio_counts.get(ticket_id, 0)
                     v = self._video_counts.get(ticket_id, 0)
-                    buf_size = len(pipeline._raw_audio_buffer.get(ticket_id, b""))
+                    buf_size = len(pipeline.audio._audio_buffers.get(ticket_id, b""))
                     logger.info(
                         f"[Control] {ticket_id} 발화 종료 -> "
-                        f"오디오 {a}청크{buf_size/1024}kb / 영상 {v}프레임 수신 확인"
+                        f"오디오 {a}청크 / VAD 누적 {buf_size/1024:.1f}kb / 영상 {v}프레임 수신 확인"
                     )
                     # 다음 턴을 위해 테이블 초기화
                     self._audio_counts[ticket_id] = 0
