@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     audio_emotion_device: str = "cpu"
     voice_emotion_model_path: str = "models/voice-emotion-final"
 
+    # 더미 모드
+    # use_dummy_llm: bool = False  # USE_DUMMY_LLM=true 로 활성화
+
+    # OpenAI API (GPT-4o-mini 플랜 생성용)
+    openai_api_key: str = ""  # OPENAI_API_KEY 환경변수로 설정
+
+    # 감정 임계치
+    negative_emotion_threshold: float = 0.65
+
     # 서버 설정
     app_host: str = "0.0.0.0"
     app_port: int = 8000

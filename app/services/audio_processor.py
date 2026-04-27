@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Dict, Optional
 
 from ai_modules.schemas import STTInput, VADInput
@@ -168,11 +169,12 @@ class AudioProcessor:
         loop = asyncio.get_event_loop()
         self._stt_running[session_id] = True
         try:
+            t0 = time.time()
             stt_result = await loop.run_in_executor(
                 None, self.container.stt.transcribe, STTInput(audio_data=audio_data)
             )
             result_text = stt_result.text.strip()
-            logger.info(f"[SpeechEnd] {session_id}: STT 결과='{result_text}'")
+            logger.info(f"[SpeechEnd] {session_id}: STT 결과='{result_text}' ({time.time() - t0:.2f}초)")
             return result_text or None
         except Exception as e:
             logger.error(f"[SpeechEnd] {session_id}: STT 오류: {e}")

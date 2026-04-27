@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import numpy as np
 from typing import Dict, List, Optional
 
@@ -8,6 +9,7 @@ from ai_modules.schemas import (
 )
 from app.core.container import AIContainer
 from app.services.audio_processor import AudioProcessor
+from app.services.counseling_session import CounselingSession
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,7 @@ class CounselingPipeline:
     def __init__(self, container: AIContainer):
         self.container = container
         self.audio = AudioProcessor(container)
+        self.session = CounselingSession(container)
         # 세션별 비오디오 버퍼
         self._counseling_setup: Dict[str, Optional[CounselingSetup]] = {}
         self._face_emotion_buffer: Dict[str, List[EmotionResult]] = {}
@@ -30,8 +33,6 @@ class CounselingPipeline:
         self._raw_audio_buffer: Dict[str, bytearray] = {}
         # 청크별 실시간 STT 누적 텍스트 (VAD 미사용 경로 폴백용)
         self._chunk_stt_text: Dict[str, str] = {}
-        # 대화 히스토리 (멀티턴): [{"role": "user"|"assistant", "content": "..."}]
-        self._conversation_history: Dict[str, List[Dict[str, str]]] = {}
         # 음성 감정 분석용 마지막 PCM 스냅샷
         self._last_pcm_audio: Dict[str, bytes] = {}
         # 음성 감정 분석 백그라운드 태스크 (LLM과 병렬 실행)
@@ -41,18 +42,19 @@ class CounselingPipeline:
 
     def init_session(self, session_id: str) -> None:
         self.audio.init_session(session_id)
+        self.session.init_session(session_id)
         self._counseling_setup[session_id] = None
         self._face_emotion_buffer[session_id] = []
         self._voice_emotion_buffer[session_id] = []
         self._stt_text_buffer[session_id] = []
         self._raw_audio_buffer[session_id] = bytearray()
         self._chunk_stt_text[session_id] = ""
-        self._conversation_history[session_id] = []
         self._last_pcm_audio[session_id] = b""
         logger.info(f"세션 초기화: {session_id}")
 
     def cleanup_session(self, session_id: str) -> None:
         self.audio.cleanup_session(session_id)
+        self.session.cleanup_session(session_id)
         # 음성 감정 태스크가 남아있으면 취소
         task = self._voice_emotion_tasks.pop(session_id, None)
         if task and not task.done():
@@ -64,7 +66,6 @@ class CounselingPipeline:
             self._stt_text_buffer,
             self._raw_audio_buffer,
             self._chunk_stt_text,
-            self._conversation_history,
             self._last_pcm_audio,
         ):
             buf.pop(session_id, None)
@@ -82,30 +83,6 @@ class CounselingPipeline:
             content=content
         )
         logger.info(f"[Setup] {session_id}: topic={topic} / mood={mood}")
-
-    # 초기 CBT 질문 생성 (setup 데이터 → LLM → 초기 질문 반환)
-    def generate_initial_questions(self, session_id: str) -> Optional[LLMResponse]:
-        setup = self._counseling_setup.get(session_id)
-        if not setup:
-            logger.warning(f"[InitialQ] {session_id}: 초기 설정 없음")
-            return None
-        if self.container.llm is None:
-            logger.warning(f"[InitialQ] {session_id}: LLM 미로딩, 건너뜀")
-            return None
-        setup_text = f"주제: {setup.topic}, 기분: {setup.mood}, 내용: {setup.content}"
-        llm_context = LLMContext(user_text=setup_text)
-        response = self.container.llm.generate_response(llm_context)
-        logger.info(f"[InitialQ] {session_id}: '{response.reply_text}'")
-
-        # 초기 질문을 히스토리에 저장 (이후 대화에서 맥락 유지)
-        if session_id in self._conversation_history:
-            self._conversation_history[session_id].append(
-                {"role": "user", "content": "[상담 시작] " + setup_text}
-            )
-            self._conversation_history[session_id].append(
-                {"role": "assistant", "content": response.reply_text}
-            )
-        return response
 
     # 오디오 청크 → VAD 필터 → 음성 구간만 _audio_buffers에 누적 (AudioProcessor에 위임)
     def append_audio_chunk(self, session_id: str, chunk: bytes) -> bool:
@@ -225,13 +202,17 @@ class CounselingPipeline:
     # 음성 감정 분석 백그라운드 태스크
     async def _analyze_voice_emotion(self, session_id: str, voice_pcm: bytes) -> None:
         try:
+            t0 = time.time()
             loop = asyncio.get_event_loop()
             voice_emotion = await loop.run_in_executor(
                 None, self.container.audio_emotion.analyze, STTInput(audio_data=voice_pcm)
             )
             if session_id in self._voice_emotion_buffer:
                 self._voice_emotion_buffer[session_id].append(voice_emotion)
-                logger.info(f"[VoiceEmo] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
+                logger.info(
+                    f"[VoiceEmo] {session_id}: {voice_emotion.primary_emotion} "
+                    f"{voice_emotion.probabilities} ({time.time() - t0:.2f}초)"
+                )
         except Exception as e:
             logger.error(f"[VoiceEmo] {session_id}: 오류: {e}")
 
@@ -252,7 +233,7 @@ class CounselingPipeline:
         primary = max(prob_dict, key=prob_dict.get)
         return EmotionResult(primary_emotion=primary, probabilities=prob_dict)
 
-    # STT 누적 텍스트 + 3모달 감정 융합 + 히스토리 → LLM 응답 생성
+    # STT 누적 텍스트 + 3모달 감정 융합 + 스텝별 시스템 프롬프트 + 히스토리 → LLM 응답 생성
     async def generate_response(self, session_id: str) -> Optional[LLMResponse]:
         accumulated_text = " ".join(self._stt_text_buffer.get(session_id, []))
         if not accumulated_text:
@@ -266,15 +247,44 @@ class CounselingPipeline:
 
         face_emotions = self._face_emotion_buffer.get(session_id, [])
         voice_emotions = self._voice_emotion_buffer.get(session_id, [])
-        history = self._conversation_history.get(session_id, [])
+        # 단일 히스토리 소스: CounselingSession._histories
+        history = self.session.get_history(session_id)
         loop = asyncio.get_event_loop()
+
+        # ── 현재 단계 + 질문 정보 (StepManager) ──────────────
+        step_mgr = self.session.get_step_manager(session_id)
+        if step_mgr:
+            base_prompt = step_mgr.get_system_prompt()
+            current_q = step_mgr.get_current_question()
+            q_idx = step_mgr.current_question_idx
+            total_q = len(step_mgr.get_questions())
+            # 현재 질문을 system_prompt에 주입
+            if current_q:
+                system_prompt = (
+                    f"{base_prompt}\n\n"
+                    f"[현재 질문 ({q_idx + 1}/{total_q})] {current_q}"
+                )
+            else:
+                system_prompt = base_prompt
+            logger.info(
+                f"[Generate] {session_id}: Step {step_mgr.step_number} "
+                f"'{step_mgr.current_step['title']}' "
+                f"Q{q_idx + 1}/{total_q}: '{current_q}'"
+            )
+        else:
+            system_prompt = None
+            logger.warning(f"[Generate] {session_id}: StepManager 없음, 기본 프롬프트 사용")
 
         # ── 텍스트 감정 분석 (run_in_executor → 이벤트 루프 비점유) ──
         try:
+            t0 = time.time()
             text_emo = await loop.run_in_executor(
                 None, self.container.text_emotion.analyze, accumulated_text
             )
-            logger.info(f"[TextEmo] {session_id}: {text_emo.primary_emotion} {text_emo.probabilities}")
+            logger.info(
+                f"[TextEmo] {session_id}: {text_emo.primary_emotion} "
+                f"{text_emo.probabilities} ({time.time() - t0:.2f}초)"
+            )
         except Exception as e:
             logger.error(f"[TextEmo] {session_id}: 오류: {e}")
             text_emo = EmotionResult(primary_emotion="neutral", probabilities={"neutral": 1.0})
@@ -285,11 +295,12 @@ class CounselingPipeline:
 
         # ── 3모달 감정 융합 ───────────────────────────────────
         try:
+            t0 = time.time()
             fused_emo = self.container.fusion.fuse(text_emo, voice_emo, face_emo)
             logger.info(
                 f"[Fusion] {session_id}: text={text_emo.primary_emotion} "
                 f"voice={voice_emo.primary_emotion} face={face_emo.primary_emotion} "
-                f"→ fused={fused_emo.primary_emotion}"
+                f"→ fused={fused_emo.primary_emotion} ({time.time() - t0:.2f}초)"
             )
         except Exception as e:
             logger.error(f"[Fusion] {session_id}: 오류: {e}")
@@ -297,49 +308,45 @@ class CounselingPipeline:
 
         logger.info(
             f"[Generate] {session_id}: face {len(face_emotions)}건, "
-            f"voice {len(voice_emotions)}건, history {len(history)//2}턴 → AI 전달"
+            f"voice {len(voice_emotions)}건, history {len(history)//2}턴 → LLM 전달"
         )
-        logger.info(f"[Generate] {session_id}: 누적 텍스트='{accumulated_text}'")
-
-        # 첫 번째 턴에만 [상담 설정] 접두어 포함
-        setup = self._counseling_setup.get(session_id)
-        if setup and not history:
-            context_prefix = (
-                f"[상담 설정] 주제: {setup.topic} / 기분: {setup.mood}"
-                f" / 내용: {setup.content}\n\n"
-                f"[사용자 발화] "
-            )
-            full_text = context_prefix + accumulated_text
-        else:
-            full_text = accumulated_text
 
         llm_context = LLMContext(
-            user_text=full_text,
+            user_text=accumulated_text,
+            system_prompt=system_prompt,
             face_emotions=face_emotions,
             voice_emotions=voice_emotions,
             text_emotion=text_emo.primary_emotion,
             fused_emotion=fused_emo.primary_emotion,
             history=history,
         )
+
         # LLM 추론 (run_in_executor → GPU 연산 중에도 이벤트 루프 유지)
+        t0 = time.time()
         response = await loop.run_in_executor(
             None, self.container.llm.generate_response, llm_context
         )
-        logger.info(f"[LLM] {session_id}: '{response.reply_text}'")
+        logger.info(
+            f"[LLM] {session_id}: '{response.reply_text}' "
+            f"({time.time() - t0:.2f}초, 어댑터: {self.container.llm._active_adapter})"
+        )
         if response.suggested_action:
             logger.info(f"[LLM] 추천 행동: '{response.suggested_action}'")
 
-        # 히스토리에 이번 턴 추가 (clean 텍스트, 설정 접두어 없이)
-        if session_id in self._conversation_history:
-            self._conversation_history[session_id].append(
-                {"role": "user", "content": accumulated_text}
-            )
-            self._conversation_history[session_id].append(
-                {"role": "assistant", "content": response.reply_text}
-            )
-            # 최대 20개 메시지(10턴) 유지 → 토큰 오버플로우 방지
-            if len(self._conversation_history[session_id]) > 20:
-                self._conversation_history[session_id] = self._conversation_history[session_id][-20:]
+        # 히스토리에 이번 턴 추가 (CounselingSession 단일 관리)
+        self.session.add_to_history(session_id, accumulated_text, response.reply_text)
+
+        # 질문 소화 → 다음 질문 or 다음 스텝 전환
+        if step_mgr:
+            transition = step_mgr.advance_question()
+            if transition == "step_changed":
+                logger.info(
+                    f"[StepMgr] {session_id}: → Step {step_mgr.step_number} "
+                    f"'{step_mgr.current_step['title']}' 시작 "
+                    f"(Q1: '{step_mgr.get_current_question()}')"
+                )
+            elif transition == "counseling_complete":
+                logger.info(f"[StepMgr] {session_id}: 전체 상담 완료")
 
         # 다음 발화를 위해 감정/STT 버퍼 초기화
         self._stt_text_buffer[session_id] = []

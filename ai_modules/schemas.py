@@ -39,7 +39,7 @@ class FaceInput(BaseModel):
 # --- 4. LLM (상담 생성) ---
 class LLMContext(BaseModel):
     user_text: str
-    #counseling_setup: Optional[CounselingSetup] = None
+    system_prompt: Optional[str] = None   # 커스텀 시스템 프롬프트 (None이면 기본 프롬프트)
     face_emotions: List[EmotionResult] = []
     voice_emotions: List[EmotionResult] = []
     text_emotion: Optional[str] = None    # STT 텍스트 감정 (primary label)

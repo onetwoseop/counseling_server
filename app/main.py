@@ -1,18 +1,26 @@
 import asyncio # 비동기 처리 라이브러리
+import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager # 수명 주기 관리
+from app.core.config import settings
 from app.core.container import ai_container # 모델 정보(전역 인스턴스) 가져오기
 from app.services.session_manager import manager
+
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # 수명 주기 정의
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(">>> AI 모델 로딩을 시작합니다.....")
+    logger.info("AI 모델 로딩을 시작합니다...")
     ai_container.load_models() # 모델들을 메모리에 올려둠
     yield # 서버 실행 시점
-    print(">>> 서버 종료.")
+    logger.info("서버 종료.")
 
 # 앱 생성
 app = FastAPI(title="AI 상담소 서버", lifespan=lifespan)
@@ -53,7 +61,7 @@ async def counseling_endpoint(websocket: WebSocket, ticket_id: str):
     except WebSocketDisconnect:
         await manager.disconnect(ticket_id)
     except Exception as e:
-        print(f"웹소켓 에러 발생: {e}")
+        logger.error(f"웹소켓 에러 발생: {e}")
         await manager.disconnect(ticket_id)
 
 if __name__ == "__main__":

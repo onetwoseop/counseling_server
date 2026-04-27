@@ -6,6 +6,9 @@ from ai_modules.models import (
     EmotionFusionModel, CBTLLMModel,
 )
 from app.core.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class AIContainer:
@@ -21,7 +24,7 @@ class AIContainer:
         self.llm = None
 
     def load_models(self):
-        print(">>> 컨테이너 모델 로딩.....")
+        logger.info("컨테이너 모델 로딩...")
 
         self.vad = SileroVADModel(speech_threshold=settings.vad_speech_threshold)
         self.vad.load_model()
@@ -57,7 +60,7 @@ class AIContainer:
         )
         self.llm.load_model()
 
-        print(">>> 모든 모델 로딩 완료")
+        logger.info("모든 모델 로딩 완료")
 
 
 # 전역 인스턴스

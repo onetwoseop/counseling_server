@@ -56,7 +56,7 @@ class TextEmotionModel(BaseTextEmotionModel):
             self.model_path, torch_dtype=dtype
         ).to(self.device)
         self.model.eval()
-        print(f"[TextEmo] 로딩 완료: {self.model_path} on {self.device}")
+        logger.info(f"[TextEmo] 로딩 완료: {self.model_path} on {self.device}")
 
     def analyze(self, text: str) -> EmotionResult:
         import torch
@@ -102,7 +102,7 @@ class Wav2VecEmotionModel(BaseEmotionModel):
             self.model_path
         ).to(self.device)
         self.model.eval()
-        print(f"[VoiceEmo] Wav2Vec2 로딩 완료: {self.model_path} on {self.device}")
+        logger.info(f"[VoiceEmo] Wav2Vec2 로딩 완료: {self.model_path} on {self.device}")
 
     def analyze(self, input_data: STTInput) -> EmotionResult:
         import torch
@@ -212,8 +212,8 @@ class CBTLLMModel(BaseLLMModel):
             logger.warning("[CBT LLM] CUDA 사용 불가 → CPU 모드 (매우 느림)")
             self.device = "cpu"
 
-        print(f"[CBT LLM] {self.base_model_name} 로딩 중 (8bit 양자화, device={self.device})...")
-        print("[CBT LLM] 최초 실행 시 HuggingFace에서 베이스 모델 다운로드 (~6GB, 수분 소요)")
+        logger.info(f"[CBT LLM] {self.base_model_name} 로딩 중 (8bit 양자화, device={self.device})...")
+        logger.info("[CBT LLM] 최초 실행 시 HuggingFace에서 베이스 모델 다운로드 (~6GB, 수분 소요)")
 
         # 8bit 양자화 설정 (6GB VRAM에서 3B 모델 구동: ~3.5GB 사용)
         if self.device == "cuda":
@@ -249,7 +249,7 @@ class CBTLLMModel(BaseLLMModel):
 
         self.model.set_adapter("cbt")
         self.model.eval()
-        print(f"[CBT LLM] 로딩 완료. 감정 LoRA 로드: {loaded}")
+        logger.info(f"[CBT LLM] 로딩 완료. 감정 LoRA 로드: {loaded}")
 
     def _switch_adapter(self, fused_emotion: Optional[str]) -> None:
         """감정에 맞는 LoRA 어댑터로 전환 (같은 어댑터면 스킵)."""
@@ -272,8 +272,9 @@ class CBTLLMModel(BaseLLMModel):
         # 융합 감정으로 LoRA 어댑터 전환
         self._switch_adapter(context.fused_emotion)
 
-        # 메시지 구성
-        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        # 메시지 구성 (커스텀 시스템 프롬프트 지원)
+        system_prompt = context.system_prompt or self.SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system_prompt}]
         for h in context.history:
             messages.append(h)
 

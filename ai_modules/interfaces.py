@@ -1,6 +1,9 @@
 import abc
+import logging
 import numpy as np
 from typing import Any
+
+logger = logging.getLogger(__name__)
 from .schemas import (
     VADInput, VADOutput, STTInput, STTOutput,
     EmotionResult, LLMContext, LLMResponse, FaceInput
@@ -72,7 +75,7 @@ class SileroVADModel(BaseVADModel):
             trust_repo=True,
         )
         self.model.eval()
-        print("[VAD] Silero VAD Loaded")
+        logger.info("[VAD] Silero VAD Loaded")
 
     def process(self, input_data: VADInput) -> VADOutput:
         import torch
@@ -99,11 +102,11 @@ class FasterWhisperSTTModel(BaseSTTModel):
         import torch
         from faster_whisper import WhisperModel
         if self.device == "cuda" and not torch.cuda.is_available():
-            print("[STT] CUDA 사용 불가 → CPU로 폴백")
+            logger.warning("[STT] CUDA 사용 불가 → CPU로 폴백")
             self.device = "cpu"
             self.compute_type = "int8"
         self.model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
-        print(f"[STT] faster-whisper ({self.model_size}) Loaded on {self.device} ({self.compute_type})")
+        logger.info(f"[STT] faster-whisper ({self.model_size}) Loaded on {self.device} ({self.compute_type})")
 
     def transcribe(self, input_data: STTInput) -> STTOutput:
         audio_array = np.frombuffer(input_data.audio_data, dtype=np.float32)
@@ -139,7 +142,7 @@ class DeepFaceFaceEmotionModel(BaseEmotionModel):
             DeepFace.analyze(dummy, actions=["emotion"], enforce_detection=False, silent=True)
         except Exception:
             pass
-        print("[Face] DeepFace Loaded")
+        logger.info("[Face] DeepFace Loaded")
 
     def analyze(self, input_data: FaceInput) -> EmotionResult:
         import cv2
@@ -160,5 +163,6 @@ class DeepFaceFaceEmotionModel(BaseEmotionModel):
                 primary_emotion=primary,
                 probabilities={k: round(v / 100, 3) for k, v in emotions.items()},
             )
-        except Exception:
+        except Exception as e:
+            logger.error(f"[Face] 분석 오류: {e}")
             return EmotionResult(primary_emotion="neutral", probabilities={"neutral": 1.0})
