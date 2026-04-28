@@ -69,7 +69,7 @@ class CounselingSession:
         self, session_id: str, topic: str, mood: str, content: str
     ) -> Dict[str, Any]:
         """
-        초기 상담 시작: setup → 플랜 생성 → 첫 발화 생성.
+        초기 상담 시작: GPT 플랜 생성 + Qwen 첫 발화를 asyncio.gather로 병렬 실행.
 
         Returns: {
             "plan": [...],
@@ -80,22 +80,32 @@ class CounselingSession:
         setup = CounselingSetup(topic=topic, mood=mood, content=content)
         self._setups[session_id] = setup
 
-        # 1. GPT-4o-mini로 5-step 플랜 생성
         loop = asyncio.get_event_loop()
         t0 = time.time()
-        plan = await loop.run_in_executor(
+
+        # GPT 플랜 생성 + Qwen 첫 발화 병렬 실행
+        # - 첫 발화는 플랜 없이 즉시 생성 가능한 인트로 프롬프트 사용
+        # - GPT 플랜이 완료되면 StepManager 초기화 → 2번째 턴부터 GPT 질문 주입
+        plan_future = loop.run_in_executor(
             None, self.plan_generator.generate, topic, mood, content
         )
-        logger.info(f"[Session] {session_id}: 플랜 생성 완료 ({time.time() - t0:.2f}초)")
+        first_msg_coro = self._generate_quick_opening(session_id, setup)
 
-        # 2. StepManager 초기화
+        plan, first_message = await asyncio.gather(plan_future, first_msg_coro)
+        logger.info(
+            f"[Session] {session_id}: 플랜+첫발화 병렬 완료 ({time.time() - t0:.2f}초)"
+        )
+
+        # StepManager 초기화 (GPT 플랜 완료 후)
         step_mgr = StepManager(plan=plan, topic=topic)
         self._step_managers[session_id] = step_mgr
+        logger.info(
+            f"[Session] {session_id}: StepManager 초기화 완료 "
+            f"(Step 1: '{step_mgr.current_step['title']}', "
+            f"Q1: '{step_mgr.get_current_question()}')"
+        )
 
-        # 3. Step 1 시스템 프롬프트로 첫 상담사 발화 생성
-        first_message = await self._generate_step_opening(session_id, setup, step_mgr)
-
-        # 4. 히스토리에 기록
+        # 히스토리에 기록
         if session_id in self._histories:
             self._histories[session_id].append(
                 {"role": "user", "content": f"[상담 시작] 주제: {topic}, 기분: {mood}, 내용: {content}"}
@@ -106,48 +116,54 @@ class CounselingSession:
 
         return {
             "plan": [
-                {"step": s["step"], "title": s["title"], "goal": s["goal"]}
+                {
+                    "step": s["step"],
+                    "title": s["title"],
+                    "goal": s["goal"],
+                    "questions": s.get("questions", []),
+                }
                 for s in plan
             ],
             "first_message": first_message,
             "step_status": step_mgr.get_status(),
         }
 
-    async def _generate_step_opening(
-        self,
-        session_id: str,
-        setup: CounselingSetup,
-        step_mgr: StepManager,
-    ) -> str:
-        """현재 단계의 시스템 프롬프트로 LLM 첫 발화 생성."""
-        system_prompt = step_mgr.get_system_prompt()
+    async def _generate_quick_opening(self, session_id: str, setup: CounselingSetup) -> str:
+        """
+        GPT 플랜 없이 즉시 생성 가능한 첫 인사 (plan_generator와 병렬 실행용).
+        인트로 프롬프트는 하드코딩 → 2번째 턴부터 GPT 플랜의 질문이 주입됨.
+        """
+        INTRO_PROMPT = (
+            "당신은 따뜻하고 공감적인 AI 심리상담사 '루나'입니다. "
+            "내담자가 처음 상담실에 들어왔습니다. "
+            "내담자의 상황을 읽고 CBT 상담사로서 따뜻하게 맞이하며, "
+            "현재 감정을 탐색할 수 있는 열린 질문을 하나만 하세요. "
+            "답변은 2~3문장으로 간결하게, 반드시 한국어로만 작성하고 영어 단어는 절대 사용하지 마세요."
+        )
         user_text = (
             f"[상담 시작]\n"
             f"주제: {setup.topic}\n"
             f"현재 기분: {setup.mood}\n"
             f"호소 내용: {setup.content}\n\n"
-            f"위 내용을 바탕으로, 내담자에게 첫 인사와 함께 "
-            f"감정을 탐색할 수 있는 열린 질문을 해주세요."
+            f"따뜻한 첫 인사와 감정 탐색 열린 질문을 한국어로 해주세요."
         )
+
+        if self.container.llm is None:
+            logger.warning(f"[Session] {session_id}: LLM 미로딩 → 기본 첫 인사 사용")
+            return "안녕하세요, 오늘 어떤 이야기를 나눠볼까요?"
 
         llm_context = LLMContext(
             user_text=user_text,
-            system_prompt=system_prompt,
+            system_prompt=INTRO_PROMPT,
             history=[],
         )
-
         loop = asyncio.get_event_loop()
         t0 = time.time()
-
-        if self.container.llm is None:
-            logger.warning(f"[Session] {session_id}: LLM 미로딩")
-            return "안녕하세요, 오늘 어떤 이야기를 나눠볼까요?"
-
         response = await loop.run_in_executor(
             None, self.container.llm.generate_response, llm_context
         )
         logger.info(
-            f"[Session] {session_id}: 첫 발화 생성 완료 "
+            f"[Session] {session_id}: 첫 발화 완료 "
             f"('{response.reply_text[:50]}...', {time.time() - t0:.2f}초)"
         )
         return response.reply_text

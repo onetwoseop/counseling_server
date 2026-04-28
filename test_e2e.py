@@ -114,10 +114,11 @@ def run_test():
             if len(voice_buf) == 0:
                 print("  !! 음성 감정 버퍼 비어있음 — END_OF_SPEECH 이후 채워짐")
 
-            # ── 8. LLM 응답 확인 ──────────────────────────────────
+            # ── 8. LLM 응답 확인 (턴 1) ───────────────────────────
             msg = ws.receive_json()
             assert msg["status"] == "response", f"예상 response, 실제: {msg}"
-            print(f"\n[8] LLM 응답: \"{msg['message']}\"")
+            print(f"\n[8] 턴1 LLM 응답: \"{msg['message']}\"")
+            print(f"    step_status: {msg.get('step_status', '없음')}")
 
             # StepManager 상태 직접 확인
             step_mgr = server_pipeline.session.get_step_manager(SESSION_ID)
@@ -125,10 +126,53 @@ def run_test():
                 print(f"    StepManager: Step {step_mgr.step_number}, Q{step_mgr.current_question_idx + 1}/{len(step_mgr.get_questions())}")
                 print(f"    다음 질문: '{step_mgr.get_current_question()}'")
 
-            # ── 9. 세션 종료 ──────────────────────────────────────
+            # ── 9. 멀티턴 반복 (최대 3턴 추가) ───────────────────
+            MULTITURN_REPLIES = [
+                "요즘 너무 힘들어요. 엄마랑 말을 안 하게 됐어요.",
+                "저도 잘 모르겠는데, 사소한 말다툼이 커진 것 같아요.",
+                "맞아요, 예전에도 비슷한 일이 있었던 것 같아요.",
+            ]
+
+            raw_audio = np.fromfile(AUDIO_FILE, dtype=np.float32)
+            samples_per_chunk = SAMPLE_RATE * CHUNK_SEC
+
+            for turn_idx, reply_text in enumerate(MULTITURN_REPLIES, start=2):
+                step_mgr = server_pipeline.session.get_step_manager(SESSION_ID)
+                if step_mgr and step_mgr.is_complete:
+                    print(f"\n[턴{turn_idx}] 모든 단계 완료 → 멀티턴 종료")
+                    break
+
+                print(f"\n[9-{turn_idx}] 턴{turn_idx} 시작 — 사용자 발화: \"{reply_text}\"")
+
+                # 오디오 청크 전송
+                for i in range(min(2, len(raw_audio) // samples_per_chunk)):
+                    seg = raw_audio[i * samples_per_chunk : (i + 1) * samples_per_chunk]
+                    ws.send_bytes(bytes([0x01]) + seg.tobytes())
+                    time.sleep(0.5)
+
+                # END_OF_SPEECH
+                ws.send_json({"type": "control", "data": "END_OF_SPEECH"})
+                print(f"  → END_OF_SPEECH 전송")
+
+                # stt_done + response 대기
+                while True:
+                    msg = ws.receive_json()
+                    if msg["status"] == "processing":
+                        print(f"  → 처리 중...")
+                    elif msg["status"] == "stt_done":
+                        print(f"  → STT: \"{msg['text']}\"")
+                    elif msg["status"] == "response":
+                        print(f"  → LLM 응답: \"{msg['message']}\"")
+                        print(f"     step_status: {msg.get('step_status', '없음')}")
+                        step_mgr = server_pipeline.session.get_step_manager(SESSION_ID)
+                        if step_mgr and not step_mgr.is_complete:
+                            print(f"     StepManager: Step {step_mgr.step_number}, Q{step_mgr.current_question_idx + 1}/{len(step_mgr.get_questions())}")
+                        break
+
+            # ── 10. 세션 종료 ─────────────────────────────────────
             ws.send_json({"type": "control", "data": "END_OF_SESSION"})
-            print("[9] END_OF_SESSION → 테스트 종료")
-            print("\n✓ 전체 테스트 완료")
+            print("\n[10] END_OF_SESSION → 테스트 종료")
+            print("\n✓ 멀티턴 전체 테스트 완료")
 
 
 if __name__ == "__main__":

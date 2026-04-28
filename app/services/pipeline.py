@@ -187,14 +187,8 @@ class CounselingPipeline:
         if session_id not in self._stt_text_buffer:
             return None
 
-        # 음성 감정 분석 — LLM과 병렬 실행하기 위해 백그라운드 태스크로 분리
-        # generate_response() 초반에 결과를 join함
-        voice_pcm = self.audio.get_last_audio_snapshot(session_id)
-        if voice_pcm and session_id in self._voice_emotion_buffer:
-            self._voice_emotion_tasks[session_id] = asyncio.create_task(
-                self._analyze_voice_emotion(session_id, voice_pcm)
-            )
-
+        # 발화 중 청크별 음성 감정이 이미 _voice_emotion_buffer에 누적되어 있으므로
+        # 전체 버퍼 재분석 태스크는 생략 (17초 절약)
         self._stt_text_buffer[session_id].append(accumulated)
         logger.info(f"[SpeechEnd] {session_id}: 최종 텍스트 = '{accumulated}'")
         return STTOutput(text=accumulated, language="ko")
@@ -234,16 +228,12 @@ class CounselingPipeline:
         return EmotionResult(primary_emotion=primary, probabilities=prob_dict)
 
     # STT 누적 텍스트 + 3모달 감정 융합 + 스텝별 시스템 프롬프트 + 히스토리 → LLM 응답 생성
-    async def generate_response(self, session_id: str) -> Optional[LLMResponse]:
+    # 반환: {"llm_response": LLMResponse, "transition": str|None, "step_status": dict, "next_step_status": dict}
+    async def generate_response(self, session_id: str) -> Optional[dict]:
         accumulated_text = " ".join(self._stt_text_buffer.get(session_id, []))
         if not accumulated_text:
             logger.warning(f"[Generate] {session_id}: 누적 텍스트 없음, 건너뜀")
             return None
-
-        # 음성 감정 백그라운드 태스크 완료 대기 (on_speech_end에서 시작, LLM과 병렬 실행됨)
-        voice_task = self._voice_emotion_tasks.pop(session_id, None)
-        if voice_task:
-            await voice_task
 
         face_emotions = self._face_emotion_buffer.get(session_id, [])
         voice_emotions = self._voice_emotion_buffer.get(session_id, [])
@@ -253,19 +243,32 @@ class CounselingPipeline:
 
         # ── 현재 단계 + 질문 정보 (StepManager) ──────────────
         step_mgr = self.session.get_step_manager(session_id)
+        user_text_for_llm = accumulated_text  # LLM에 전달할 텍스트 (질문 힌트 포함 가능)
         if step_mgr:
             base_prompt = step_mgr.get_system_prompt()
             current_q = step_mgr.get_current_question()
             q_idx = step_mgr.current_question_idx
             total_q = len(step_mgr.get_questions())
-            # 현재 질문을 system_prompt에 주입
+            KOREAN_RULE = "반드시 한국어로만 대답하세요. 영어 단어를 절대 사용하지 마세요."
             if current_q:
+                # ① system_prompt: 구조화된 응답 형식 지시
                 system_prompt = (
                     f"{base_prompt}\n\n"
-                    f"[현재 질문 ({q_idx + 1}/{total_q})] {current_q}"
+                    f"[이번 응답 지시 - 반드시 준수]\n"
+                    f"① 사용자의 말에 1~2문장으로 진심 어린 공감을 표현하세요.\n"
+                    f"② 아래 CBT 질문을 자연스럽게 이어서 마지막에 물어보세요:\n"
+                    f"   {current_q}\n"
+                    f"③ 이 질문 외에 다른 질문은 절대 추가하지 마세요.\n"
+                    f"④ {KOREAN_RULE}"
+                )
+                # ② user_text: 소형 LLM은 system보다 최근 user 메시지를 더 강하게 따름
+                #    → 질문을 user_text 끝에도 명시하여 이중 강조 (히스토리엔 원본만 저장)
+                user_text_for_llm = (
+                    f"{accumulated_text}\n\n"
+                    f"[지금 반드시 이 질문으로 마무리하세요: {current_q}]"
                 )
             else:
-                system_prompt = base_prompt
+                system_prompt = base_prompt + f"\n\n{KOREAN_RULE}"
             logger.info(
                 f"[Generate] {session_id}: Step {step_mgr.step_number} "
                 f"'{step_mgr.current_step['title']}' "
@@ -312,7 +315,7 @@ class CounselingPipeline:
         )
 
         llm_context = LLMContext(
-            user_text=accumulated_text,
+            user_text=user_text_for_llm,   # 질문 힌트 포함 버전 (LLM 전용)
             system_prompt=system_prompt,
             face_emotions=face_emotions,
             voice_emotions=voice_emotions,
@@ -336,7 +339,11 @@ class CounselingPipeline:
         # 히스토리에 이번 턴 추가 (CounselingSession 단일 관리)
         self.session.add_to_history(session_id, accumulated_text, response.reply_text)
 
+        # advance_question() 전 상태 스냅샷 (Qwen이 방금 다룬 질문 정보)
+        pre_advance_status = step_mgr.get_status() if step_mgr else None
+
         # 질문 소화 → 다음 질문 or 다음 스텝 전환
+        transition: Optional[str] = None
         if step_mgr:
             transition = step_mgr.advance_question()
             if transition == "step_changed":
@@ -348,12 +355,20 @@ class CounselingPipeline:
             elif transition == "counseling_complete":
                 logger.info(f"[StepMgr] {session_id}: 전체 상담 완료")
 
+        # advance_question() 후 상태 스냅샷 (다음에 다룰 질문 정보)
+        post_advance_status = step_mgr.get_status() if step_mgr else None
+
         # 다음 발화를 위해 감정/STT 버퍼 초기화
         self._stt_text_buffer[session_id] = []
         self._face_emotion_buffer[session_id] = []
         self._voice_emotion_buffer[session_id] = []
 
-        return response
+        return {
+            "llm_response": response,
+            "transition": transition,          # None | "step_changed" | "counseling_complete"
+            "step_status": pre_advance_status, # Qwen이 방금 다룬 질문 기준 상태
+            "next_step_status": post_advance_status,  # 다음에 다룰 질문 기준 상태
+        }
 
 
 # 전역 인스턴스 (session_manager에서 import해서 사용)

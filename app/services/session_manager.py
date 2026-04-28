@@ -70,12 +70,34 @@ class ConnectionManager:
         )
 
         # LLM 응답 생성 및 전송
-        llm_response = await pipeline.generate_response(ticket_id)
-        if llm_response:
+        result = await pipeline.generate_response(ticket_id)
+        if result:
+            llm_response = result["llm_response"]
+            transition = result["transition"]
+            step_status = result["step_status"]           # Qwen이 방금 다룬 질문 기준
+            next_step_status = result["next_step_status"] # 다음에 다룰 질문 기준
+
+            # AI 응답 전송 (방금 다룬 질문 기준 step_status 포함)
             await self.send_personal_message(
-                {"status": "response", "message": llm_response.reply_text},
-                ticket_id
+                {
+                    "status": "response",
+                    "message": llm_response.reply_text,
+                    "step_status": step_status,
+                },
+                ticket_id,
             )
+
+            # 스텝 전환 발생 시 별도 알림 전송
+            if transition in ("step_changed", "counseling_complete"):
+                await self.send_personal_message(
+                    {
+                        "status": "step_changed",
+                        "transition": transition,          # "step_changed" | "counseling_complete"
+                        "step_status": next_step_status,  # 새 스텝 정보
+                    },
+                    ticket_id,
+                )
+                logger.info(f"[Session] {ticket_id}: step_changed 알림 전송 → {transition}")
 
     # [데이터 처리 파이프라인 1]텍스트 프레임 처리
     async def process_text_data(self, ticket_id: str, raw_text: str):

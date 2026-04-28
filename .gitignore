@@ -20,6 +20,13 @@ tmp/
 test_files/
 temp_frames/
 **/webm
+*.mp4
+*.wav
+*.mp3
+*.webm
+
+# 테스트
+test_*.py
 
 # OS
 .DS_Store
