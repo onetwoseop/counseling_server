@@ -10,6 +10,10 @@ from app.services.pipeline import pipeline
 
 logger = logging.getLogger(__name__)
 
+# 페이로드 크기 제한 (DoS 방어)
+MAX_BINARY_BYTES = 1_000_000   # 1MB — 음성/영상 청크 한도
+MAX_TEXT_BYTES = 100_000        # 100KB — JSON 메시지 한도
+
 # 접속자를 관리하고 데이터를 전달하는 역할, 비동기 처리
 
 class ConnectionManager:
@@ -101,6 +105,13 @@ class ConnectionManager:
 
     # [데이터 처리 파이프라인 1]텍스트 프레임 처리
     async def process_text_data(self, ticket_id: str, raw_text: str):
+        # 페이로드 크기 검증 (DoS 방어)
+        if len(raw_text) > MAX_TEXT_BYTES:
+            logger.warning(
+                f"[Session] {ticket_id}: 텍스트 페이로드 크기 초과 "
+                f"({len(raw_text)}B > {MAX_TEXT_BYTES}B), 거부"
+            )
+            return
         try:
             data_dict = json.loads(raw_text) # 데이터 Dictionary 형태로 변환
             input_obj = InputTest(**data_dict) # 데이터 규격 검사 틀
@@ -123,10 +134,8 @@ class ConnectionManager:
                 )
                 await self.send_personal_message(
                     {
-                        "status": "counseling_ready",
+                        "status": "initial_questions",
                         "message": result["first_message"],
-                        "plan": result["plan"],
-                        "analysis": result.get("analysis", {}),
                         "step_status": result["step_status"],
                     },
                     ticket_id,
@@ -166,24 +175,35 @@ class ConnectionManager:
     
     # [데이터 처리 파이프라인 2] 바이너리 프레임 전용 (순수 오디오, 비디오 데이터 입력으로 전환)
     async def process_binary_data(self, ticket_id: str, raw_bytes: bytes):
+        # 페이로드 크기 검증 (DoS 방어)
+        if len(raw_bytes) > MAX_BINARY_BYTES:
+            logger.warning(
+                f"[Session] {ticket_id}: 바이너리 페이로드 크기 초과 "
+                f"({len(raw_bytes)}B > {MAX_BINARY_BYTES}B), 거부"
+            )
+            return
+        if len(raw_bytes) < 2:
+            return  # header만으로는 처리 불가
         try:
             # 프론트엔드가 붙인 명찰 확인
             header = raw_bytes[0] # 바이너리 종류
             payload = raw_bytes[1:] # 데이터 본체
 
-            # 음성 바이너리 처리
+            # 음성 바이너리 처리 — throttled wrapper로 동시 실행 제한 (폭주 방지)
             if header == 1:
                 pipeline.append_audio_chunk(ticket_id, payload)
-                asyncio.create_task(pipeline._analyze_voice_emotion(ticket_id, payload))
+                asyncio.create_task(
+                    pipeline.analyze_voice_emotion_throttled(ticket_id, payload)
+                )
 
                 self._audio_counts[ticket_id] = self._audio_counts.get(ticket_id, 0) + 1
                 if self._audio_counts[ticket_id] % 50 == 0:
                     buf_size = len(pipeline.audio._audio_buffers.get(ticket_id, b""))
                     logger.info(f"[Audio] {ticket_id}: {self._audio_counts[ticket_id]}청크 수신 / VAD 버퍼 {buf_size//1024}kb 누적")
 
-            # 영상 바이너리 처리
+            # 영상 바이너리 처리 — async fire-and-forget으로 이벤트 루프 블로킹 방지
             elif header == 2:
-                pipeline.process_face_frame(ticket_id, payload)
+                asyncio.create_task(pipeline.process_face_frame(ticket_id, payload))
                 self._video_counts[ticket_id] = self._video_counts.get(ticket_id, 0) + 1
 
             else:

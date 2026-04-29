@@ -35,8 +35,8 @@ class CounselingPipeline:
         self._chunk_stt_text: Dict[str, str] = {}
         # 음성 감정 분석용 마지막 PCM 스냅샷
         self._last_pcm_audio: Dict[str, bytes] = {}
-        # 음성 감정 분석 백그라운드 태스크 (LLM과 병렬 실행)
-        self._voice_emotion_tasks: Dict[str, asyncio.Task] = {}
+        # 음성 감정 분석 throttle용 세션별 Lock (동시 실행 1개로 제한, 폭주 방지)
+        self._voice_emotion_locks: Dict[str, asyncio.Lock] = {}
 
     # 세션 수명 주기
 
@@ -50,15 +50,12 @@ class CounselingPipeline:
         self._raw_audio_buffer[session_id] = bytearray()
         self._chunk_stt_text[session_id] = ""
         self._last_pcm_audio[session_id] = b""
+        self._voice_emotion_locks[session_id] = asyncio.Lock()
         logger.info(f"세션 초기화: {session_id}")
 
     def cleanup_session(self, session_id: str) -> None:
         self.audio.cleanup_session(session_id)
         self.session.cleanup_session(session_id)
-        # 음성 감정 태스크가 남아있으면 취소
-        task = self._voice_emotion_tasks.pop(session_id, None)
-        if task and not task.done():
-            task.cancel()
         for buf in (
             self._counseling_setup,
             self._face_emotion_buffer,
@@ -67,6 +64,7 @@ class CounselingPipeline:
             self._raw_audio_buffer,
             self._chunk_stt_text,
             self._last_pcm_audio,
+            self._voice_emotion_locks,
         ):
             buf.pop(session_id, None)
         logger.info(f"세션 정리: {session_id}")
@@ -152,13 +150,20 @@ class CounselingPipeline:
         except Exception as e:
             logger.error(f"[RawSTT] {session_id}: 오류: {e}")
 
-    # 이미지 프레임 → 얼굴 감정 분석
-    def process_face_frame(self, session_id: str, image_bytes: bytes) -> EmotionResult:
-        face_input = FaceInput(video_frame=image_bytes)
-        result = self.container.face_emotion.analyze(face_input)
-        self._face_emotion_buffer[session_id].append(result)
-        logger.info(f"[Face] {session_id}: {result.primary_emotion} {result.probabilities}")
-        return result
+    # 이미지 프레임 → 얼굴 감정 분석 (비동기, 이벤트 루프 블로킹 방지)
+    async def process_face_frame(self, session_id: str, image_bytes: bytes) -> None:
+        try:
+            face_input = FaceInput(video_frame=image_bytes)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self.container.face_emotion.analyze, face_input
+            )
+            # cleanup race 방어: 분석 완료 시점에 세션이 종료됐을 수 있음
+            if session_id in self._face_emotion_buffer:
+                self._face_emotion_buffer[session_id].append(result)
+                logger.info(f"[Face] {session_id}: {result.primary_emotion} {result.probabilities}")
+        except Exception as e:
+            logger.error(f"[Face] {session_id}: 분석 오류: {e}")
 
     # 발화 종료 → VAD 누적 음성 일괄 STT → 음성 감정 백그라운드 시작 → 결과 반환
     async def on_speech_end(self, session_id: str) -> Optional[STTOutput]:
@@ -193,7 +198,7 @@ class CounselingPipeline:
         logger.info(f"[SpeechEnd] {session_id}: 최종 텍스트 = '{accumulated}'")
         return STTOutput(text=accumulated, language="ko")
 
-    # 음성 감정 분석 백그라운드 태스크
+    # 음성 감정 분석 백그라운드 태스크 (실제 추론)
     async def _analyze_voice_emotion(self, session_id: str, voice_pcm: bytes) -> None:
         try:
             t0 = time.time()
@@ -209,6 +214,15 @@ class CounselingPipeline:
                 )
         except Exception as e:
             logger.error(f"[VoiceEmo] {session_id}: 오류: {e}")
+
+    # 음성 감정 분석 throttled wrapper — 세션당 동시 실행 1개로 제한 (폭주 방지)
+    # 이미 분석 중이면 이 청크는 드롭. session_manager에서 매 청크마다 호출.
+    async def analyze_voice_emotion_throttled(self, session_id: str, voice_pcm: bytes) -> None:
+        lock = self._voice_emotion_locks.get(session_id)
+        if lock is None or lock.locked():
+            return
+        async with lock:
+            await self._analyze_voice_emotion(session_id, voice_pcm)
 
     # 여러 EmotionResult 리스트에서 확률 평균 → 대표 감정 1개 반환
     @staticmethod
