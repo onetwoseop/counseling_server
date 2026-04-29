@@ -212,34 +212,31 @@ class CBTLLMModel(BaseLLMModel):
             logger.warning("[CBT LLM] CUDA 사용 불가 → CPU 모드 (매우 느림)")
             self.device = "cpu"
 
-        logger.info(f"[CBT LLM] {self.base_model_name} 로딩 중 (8bit 양자화, device={self.device})...")
-        logger.info("[CBT LLM] 최초 실행 시 HuggingFace에서 베이스 모델 다운로드 (~6GB, 수분 소요)")
-
-        # 8bit 양자화 설정 (6GB VRAM에서 3B 모델 구동: ~3.5GB 사용)
         if self.device == "cuda":
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
+            props = torch.cuda.get_device_properties(0)
+            vram_gb = props.total_memory / 1024 ** 3
+            logger.info(
+                f"[CBT LLM] GPU: {torch.cuda.get_device_name(0)}, "
+                f"Compute {props.major}.{props.minor}, VRAM {vram_gb:.1f}GB"
             )
-            load_kwargs = dict(device_map="auto", quantization_config=bnb_config)
-        else:
-            load_kwargs = dict(torch_dtype=torch.float32)
 
-        # 토크나이저는 CBT 어댑터 경로에서 로드 (fine-tuned tokenizer 사용)
+        logger.info(f"[CBT LLM] {self.base_model_name} 로딩 중 (device={self.device})...")
+
         self.tokenizer = AutoTokenizer.from_pretrained(self.cbt_adapter_path)
 
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_name, **load_kwargs
-        )
-        if self.device == "cpu":
-            base_model = base_model.to("cpu")
+        base_model = self._load_base_model_with_fallback(torch, AutoModelForCausalLM, BitsAndBytesConfig)
 
-        # CBT LoRA 어댑터 로드 (기본 어댑터)
+        # 실제 디바이스 확인 로그
+        try:
+            first_param = next(base_model.parameters())
+            logger.info(f"[CBT LLM] 베이스 모델 실제 device: {first_param.device}, dtype: {first_param.dtype}")
+        except Exception:
+            pass
+
         self.model = PeftModel.from_pretrained(
             base_model, self.cbt_adapter_path, adapter_name="cbt"
         )
 
-        # 감정별 LoRA 어댑터 메모리에 미리 로드
         loaded = []
         for emotion in ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]:
             lora_path = os.path.join(self.lora_dir, emotion)
@@ -249,7 +246,83 @@ class CBTLLMModel(BaseLLMModel):
 
         self.model.set_adapter("cbt")
         self.model.eval()
+
+        if self.device == "cuda":
+            allocated = torch.cuda.memory_allocated(0) / 1024 ** 3
+            reserved = torch.cuda.memory_reserved(0) / 1024 ** 3
+            logger.info(f"[CBT LLM] 로딩 후 VRAM: 할당 {allocated:.2f}GB / 예약 {reserved:.2f}GB")
+
         logger.info(f"[CBT LLM] 로딩 완료. 감정 LoRA 로드: {loaded}")
+
+    def _load_base_model_with_fallback(self, torch, AutoModelForCausalLM, BitsAndBytesConfig):
+        """8bit → 4bit → float16 순으로 폴백하며 베이스 모델 로드."""
+        if self.device != "cuda":
+            logger.info("[CBT LLM] CPU 모드: float32 로딩")
+            return AutoModelForCausalLM.from_pretrained(
+                self.base_model_name, torch_dtype=torch.float32
+            )
+
+        # 1차 시도: 8bit 양자화
+        try:
+            logger.info("[CBT LLM] 8bit 양자화 시도...")
+            self._verify_bitsandbytes_cuda(torch)
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0)
+            model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_name,
+                device_map="auto",
+                quantization_config=bnb_config,
+            )
+            logger.info("[CBT LLM] 8bit 양자화 로딩 성공")
+            return model
+        except Exception as e:
+            logger.warning(f"[CBT LLM] 8bit 로딩 실패: {e}")
+
+        # 2차 시도: 4bit 양자화 (bitsandbytes NF4)
+        try:
+            logger.info("[CBT LLM] 4bit 양자화(NF4) 시도... (~2GB VRAM)")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_name,
+                device_map="auto",
+                quantization_config=bnb_config,
+            )
+            logger.info("[CBT LLM] 4bit 양자화 로딩 성공")
+            return model
+        except Exception as e:
+            logger.warning(f"[CBT LLM] 4bit 로딩 실패: {e}")
+
+        # 3차 시도: float16 직접 로딩 (VRAM ~6GB, OOM 위험 있음)
+        try:
+            logger.info("[CBT LLM] float16 직접 로딩 시도... (~6GB VRAM, OOM 위험)")
+            model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+            logger.info("[CBT LLM] float16 로딩 성공")
+            return model
+        except Exception as e:
+            logger.warning(f"[CBT LLM] float16 로딩 실패: {e}")
+
+        # 최종 폴백: CPU float32 (매우 느림)
+        logger.error("[CBT LLM] 모든 GPU 로딩 실패 → CPU float32 폴백 (응답 200초+ 예상)")
+        self.device = "cpu"
+        return AutoModelForCausalLM.from_pretrained(
+            self.base_model_name, torch_dtype=torch.float32
+        )
+
+    @staticmethod
+    def _verify_bitsandbytes_cuda(torch):
+        """bitsandbytes CUDA 커널이 실제로 작동하는지 빠르게 검증."""
+        import bitsandbytes as bnb
+        layer = bnb.nn.Linear8bitLt(32, 32, has_fp16_weights=False).cuda()
+        x = torch.randn(1, 32, dtype=torch.float16).cuda()
+        _ = layer(x)  # CUDA 커널 실제 실행해서 오류 없는지 확인
 
     def _switch_adapter(self, fused_emotion: Optional[str]) -> None:
         """감정에 맞는 LoRA 어댑터로 전환 (같은 어댑터면 스킵)."""
@@ -292,9 +365,9 @@ class CBTLLMModel(BaseLLMModel):
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=200,
-                temperature=0.7,
+                max_new_tokens=120,
                 do_sample=True,
+                temperature=0.7,
                 repetition_penalty=1.1,
                 pad_token_id=self.tokenizer.eos_token_id,
             )

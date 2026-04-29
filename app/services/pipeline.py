@@ -35,8 +35,8 @@ class CounselingPipeline:
         self._chunk_stt_text: Dict[str, str] = {}
         # 음성 감정 분석용 마지막 PCM 스냅샷
         self._last_pcm_audio: Dict[str, bytes] = {}
-        # 음성 감정 분석 백그라운드 태스크 (LLM과 병렬 실행)
-        self._voice_emotion_tasks: Dict[str, asyncio.Task] = {}
+        # 음성 감정 분석 throttle용 세션별 Lock (동시 실행 1개로 제한, 폭주 방지)
+        self._voice_emotion_locks: Dict[str, asyncio.Lock] = {}
 
     # 세션 수명 주기
 
@@ -50,15 +50,12 @@ class CounselingPipeline:
         self._raw_audio_buffer[session_id] = bytearray()
         self._chunk_stt_text[session_id] = ""
         self._last_pcm_audio[session_id] = b""
+        self._voice_emotion_locks[session_id] = asyncio.Lock()
         logger.info(f"세션 초기화: {session_id}")
 
     def cleanup_session(self, session_id: str) -> None:
         self.audio.cleanup_session(session_id)
         self.session.cleanup_session(session_id)
-        # 음성 감정 태스크가 남아있으면 취소
-        task = self._voice_emotion_tasks.pop(session_id, None)
-        if task and not task.done():
-            task.cancel()
         for buf in (
             self._counseling_setup,
             self._face_emotion_buffer,
@@ -67,6 +64,7 @@ class CounselingPipeline:
             self._raw_audio_buffer,
             self._chunk_stt_text,
             self._last_pcm_audio,
+            self._voice_emotion_locks,
         ):
             buf.pop(session_id, None)
         logger.info(f"세션 정리: {session_id}")
@@ -152,13 +150,20 @@ class CounselingPipeline:
         except Exception as e:
             logger.error(f"[RawSTT] {session_id}: 오류: {e}")
 
-    # 이미지 프레임 → 얼굴 감정 분석
-    def process_face_frame(self, session_id: str, image_bytes: bytes) -> EmotionResult:
-        face_input = FaceInput(video_frame=image_bytes)
-        result = self.container.face_emotion.analyze(face_input)
-        self._face_emotion_buffer[session_id].append(result)
-        logger.info(f"[Face] {session_id}: {result.primary_emotion} {result.probabilities}")
-        return result
+    # 이미지 프레임 → 얼굴 감정 분석 (비동기, 이벤트 루프 블로킹 방지)
+    async def process_face_frame(self, session_id: str, image_bytes: bytes) -> None:
+        try:
+            face_input = FaceInput(video_frame=image_bytes)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self.container.face_emotion.analyze, face_input
+            )
+            # cleanup race 방어: 분석 완료 시점에 세션이 종료됐을 수 있음
+            if session_id in self._face_emotion_buffer:
+                self._face_emotion_buffer[session_id].append(result)
+                logger.info(f"[Face] {session_id}: {result.primary_emotion} {result.probabilities}")
+        except Exception as e:
+            logger.error(f"[Face] {session_id}: 분석 오류: {e}")
 
     # 발화 종료 → VAD 누적 음성 일괄 STT → 음성 감정 백그라운드 시작 → 결과 반환
     async def on_speech_end(self, session_id: str) -> Optional[STTOutput]:
@@ -187,19 +192,13 @@ class CounselingPipeline:
         if session_id not in self._stt_text_buffer:
             return None
 
-        # 음성 감정 분석 — LLM과 병렬 실행하기 위해 백그라운드 태스크로 분리
-        # generate_response() 초반에 결과를 join함
-        voice_pcm = self.audio.get_last_audio_snapshot(session_id)
-        if voice_pcm and session_id in self._voice_emotion_buffer:
-            self._voice_emotion_tasks[session_id] = asyncio.create_task(
-                self._analyze_voice_emotion(session_id, voice_pcm)
-            )
-
+        # 발화 중 청크별 음성 감정이 이미 _voice_emotion_buffer에 누적되어 있으므로
+        # 전체 버퍼 재분석 태스크는 생략 (17초 절약)
         self._stt_text_buffer[session_id].append(accumulated)
         logger.info(f"[SpeechEnd] {session_id}: 최종 텍스트 = '{accumulated}'")
         return STTOutput(text=accumulated, language="ko")
 
-    # 음성 감정 분석 백그라운드 태스크
+    # 음성 감정 분석 백그라운드 태스크 (실제 추론)
     async def _analyze_voice_emotion(self, session_id: str, voice_pcm: bytes) -> None:
         try:
             t0 = time.time()
@@ -215,6 +214,15 @@ class CounselingPipeline:
                 )
         except Exception as e:
             logger.error(f"[VoiceEmo] {session_id}: 오류: {e}")
+
+    # 음성 감정 분석 throttled wrapper — 세션당 동시 실행 1개로 제한 (폭주 방지)
+    # 이미 분석 중이면 이 청크는 드롭. session_manager에서 매 청크마다 호출.
+    async def analyze_voice_emotion_throttled(self, session_id: str, voice_pcm: bytes) -> None:
+        lock = self._voice_emotion_locks.get(session_id)
+        if lock is None or lock.locked():
+            return
+        async with lock:
+            await self._analyze_voice_emotion(session_id, voice_pcm)
 
     # 여러 EmotionResult 리스트에서 확률 평균 → 대표 감정 1개 반환
     @staticmethod
@@ -233,42 +241,85 @@ class CounselingPipeline:
         primary = max(prob_dict, key=prob_dict.get)
         return EmotionResult(primary_emotion=primary, probabilities=prob_dict)
 
+    @staticmethod
+    def _build_dynamic_system_prompt(step_mgr, current_q, history_mgr) -> str:
+        """
+        분석(인지 왜곡) + 현재 단계(목표/집중) + 이전 단계 요약 + 응답 지시를 조립.
+        """
+        KOREAN_RULE = "반드시 한국어로만 답변하세요. 영어 단어는 절대 사용하지 마세요."
+        analysis = step_mgr.analysis or {}
+        step = step_mgr.current_step
+
+        parts = [
+            "[당신의 역할]",
+            "당신은 따뜻하고 공감적인 CBT(인지행동치료) 전문 상담사 '루나'입니다.",
+            KOREAN_RULE,
+            "",
+            "[내담자 분석]",
+            f"- 핵심 문제: {analysis.get('core_problem', '미분석')}",
+            f"- 예상 인지 왜곡: {analysis.get('cognitive_pattern', '미분석')}",
+            "",
+            f"[현재 단계: Step {step_mgr.step_number} - {step['name']}]",
+            f"- 목표: {step.get('goal', '')}",
+            f"- 집중 포인트(CBT 기법): {step.get('focus', '')}",
+        ]
+
+        # 이전 단계 요약 주입
+        if history_mgr:
+            summaries = history_mgr.get_step_summaries()
+            if summaries:
+                parts.append("")
+                parts.append("[이전 단계에서 발견한 것]")
+                for step_num in sorted(summaries.keys()):
+                    info = summaries[step_num]
+                    parts.append(f"- Step {step_num} ({info['step_name']}): {info['summary']}")
+
+        if current_q:
+            parts.extend([
+                "",
+                "[이번 응답 지시 - 반드시 준수]",
+                "① 사용자의 말에 1~2문장으로 진심 어린 공감을 표현하세요.",
+                "② 위 [집중 포인트]의 CBT 기법을 활용하여, 아래 질문을 자연스럽게 이어서 마지막에 물어보세요:",
+                f"   {current_q}",
+                "③ 이 질문 외에 다른 질문은 절대 추가하지 마세요.",
+                "④ 감정에 함몰되지 말고, 사용자의 사고 패턴과 사건 분석에 집중하세요.",
+            ])
+
+        return "\n".join(parts)
+
     # STT 누적 텍스트 + 3모달 감정 융합 + 스텝별 시스템 프롬프트 + 히스토리 → LLM 응답 생성
-    async def generate_response(self, session_id: str) -> Optional[LLMResponse]:
+    # 반환: {"llm_response": LLMResponse, "transition": str|None, "step_status": dict, "next_step_status": dict}
+    async def generate_response(self, session_id: str) -> Optional[dict]:
         accumulated_text = " ".join(self._stt_text_buffer.get(session_id, []))
         if not accumulated_text:
             logger.warning(f"[Generate] {session_id}: 누적 텍스트 없음, 건너뜀")
             return None
 
-        # 음성 감정 백그라운드 태스크 완료 대기 (on_speech_end에서 시작, LLM과 병렬 실행됨)
-        voice_task = self._voice_emotion_tasks.pop(session_id, None)
-        if voice_task:
-            await voice_task
-
         face_emotions = self._face_emotion_buffer.get(session_id, [])
         voice_emotions = self._voice_emotion_buffer.get(session_id, [])
-        # 단일 히스토리 소스: CounselingSession._histories
-        history = self.session.get_history(session_id)
+        history_mgr = self.session.get_history_manager(session_id)
+        history = history_mgr.get_recent_turns() if history_mgr else []
         loop = asyncio.get_event_loop()
 
         # ── 현재 단계 + 질문 정보 (StepManager) ──────────────
         step_mgr = self.session.get_step_manager(session_id)
+        user_text_for_llm = accumulated_text  # LLM에 전달할 텍스트 (질문 힌트 포함 가능)
         if step_mgr:
-            base_prompt = step_mgr.get_system_prompt()
             current_q = step_mgr.get_current_question()
             q_idx = step_mgr.current_question_idx
             total_q = len(step_mgr.get_questions())
-            # 현재 질문을 system_prompt에 주입
+            # 동적 system_prompt 조립 (분석 + 단계 + 이전 단계 요약 + 응답 지시)
+            system_prompt = self._build_dynamic_system_prompt(step_mgr, current_q, history_mgr)
             if current_q:
-                system_prompt = (
-                    f"{base_prompt}\n\n"
-                    f"[현재 질문 ({q_idx + 1}/{total_q})] {current_q}"
+                # 소형 LLM은 system보다 최근 user 메시지를 더 강하게 따름
+                # → 질문을 user_text 끝에도 명시하여 이중 강조 (히스토리엔 원본만 저장)
+                user_text_for_llm = (
+                    f"{accumulated_text}\n\n"
+                    f"[지금 반드시 이 질문으로 마무리하세요: {current_q}]"
                 )
-            else:
-                system_prompt = base_prompt
             logger.info(
                 f"[Generate] {session_id}: Step {step_mgr.step_number} "
-                f"'{step_mgr.current_step['title']}' "
+                f"'{step_mgr.current_step['name']}' "
                 f"Q{q_idx + 1}/{total_q}: '{current_q}'"
             )
         else:
@@ -312,7 +363,7 @@ class CounselingPipeline:
         )
 
         llm_context = LLMContext(
-            user_text=accumulated_text,
+            user_text=user_text_for_llm,   # 질문 힌트 포함 버전 (LLM 전용)
             system_prompt=system_prompt,
             face_emotions=face_emotions,
             voice_emotions=voice_emotions,
@@ -333,27 +384,60 @@ class CounselingPipeline:
         if response.suggested_action:
             logger.info(f"[LLM] 추천 행동: '{response.suggested_action}'")
 
-        # 히스토리에 이번 턴 추가 (CounselingSession 단일 관리)
-        self.session.add_to_history(session_id, accumulated_text, response.reply_text)
+        # 히스토리에 이번 턴 추가 (HistoryManager에 저장)
+        if history_mgr:
+            history_mgr.add_user_message(accumulated_text)
+            history_mgr.add_assistant_message(response.reply_text)
+
+        # advance_question() 전 상태 스냅샷 (Qwen이 방금 다룬 질문 정보)
+        pre_advance_status = step_mgr.get_status() if step_mgr else None
 
         # 질문 소화 → 다음 질문 or 다음 스텝 전환
+        transition: Optional[str] = None
         if step_mgr:
             transition = step_mgr.advance_question()
             if transition == "step_changed":
+                # 완료된 단계 요약 → HistoryManager에 저장 (다음 단계 system_prompt에 주입됨)
+                if history_mgr and pre_advance_status:
+                    completed_step_num = pre_advance_status["step"]
+                    completed_step_name = pre_advance_status["title"]
+                    # GPT 요약은 동기 호출이지만 짧음(~1-2초). 별도 thread로 실행
+                    await loop.run_in_executor(
+                        None,
+                        history_mgr.on_step_transition,
+                        completed_step_num,
+                        completed_step_name,
+                    )
                 logger.info(
                     f"[StepMgr] {session_id}: → Step {step_mgr.step_number} "
-                    f"'{step_mgr.current_step['title']}' 시작 "
+                    f"'{step_mgr.current_step['name']}' 시작 "
                     f"(Q1: '{step_mgr.get_current_question()}')"
                 )
             elif transition == "counseling_complete":
+                # 마지막 단계 요약도 저장 (리포트용)
+                if history_mgr and pre_advance_status:
+                    await loop.run_in_executor(
+                        None,
+                        history_mgr.on_step_transition,
+                        pre_advance_status["step"],
+                        pre_advance_status["title"],
+                    )
                 logger.info(f"[StepMgr] {session_id}: 전체 상담 완료")
+
+        # advance_question() 후 상태 스냅샷 (다음에 다룰 질문 정보)
+        post_advance_status = step_mgr.get_status() if step_mgr else None
 
         # 다음 발화를 위해 감정/STT 버퍼 초기화
         self._stt_text_buffer[session_id] = []
         self._face_emotion_buffer[session_id] = []
         self._voice_emotion_buffer[session_id] = []
 
-        return response
+        return {
+            "llm_response": response,
+            "transition": transition,          # None | "step_changed" | "counseling_complete"
+            "step_status": pre_advance_status, # Qwen이 방금 다룬 질문 기준 상태
+            "next_step_status": post_advance_status,  # 다음에 다룰 질문 기준 상태
+        }
 
 
 # 전역 인스턴스 (session_manager에서 import해서 사용)

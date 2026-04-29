@@ -1,138 +1,160 @@
 """
-DynamicPlanGenerator — GPT-4o-mini를 호출하여 5단계 CBT 상담 플랜을 생성.
-동기 함수로 구현 (pipeline에서 run_in_executor로 호출).
+DynamicPlanGenerator — GPT-4o-mini로 인지 왜곡 분석 + 5단계 CBT 상담 플랜 생성.
+반환 스키마: {"analysis": {core_problem, cognitive_pattern}, "steps": [...]}
 """
 
 import json
 import logging
 import time
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# GPT-4o-mini에게 보낼 플랜 생성 프롬프트
+
 PLAN_GENERATION_PROMPT = """\
-당신은 CBT(인지행동치료) 기반 심리상담 플랜을 설계하는 전문가입니다.
-아래 내담자 정보를 바탕으로, **정확히 5단계**로 구성된 상담 플랜을 JSON으로 생성하세요.
+당신은 CBT(인지행동치료) 전문 상담사입니다.
+아래 내담자 정보를 바탕으로 맞춤형 5단계 상담 계획을 JSON으로 생성하세요.
 
-## 내담자 정보
-- 상담 주제: {topic}
-- 현재 기분: {mood}
-- 호소 내용: {content}
+[내담자 정보]
+상담 주제: {topic}
+현재 감정: {mood}
+상세 고민: {content}
 
-## 출력 형식 (JSON)
-```json
+[지시사항]
+1. 내담자의 핵심 문제와 예상되는 인지 왜곡 패턴을 분석하세요 (과잉일반화, 흑백사고, 재난화, 개인화, 독심술, 감정적 추론 등)
+2. 각 단계별로 이 내담자의 구체적 상황에 맞는 목표와 질문을 설계하세요
+3. 질문은 한국어 상담사가 실제로 쓰는 자연스러운 구어체로 작성하세요
+4. 반드시 한국어로만 작성하세요
+5. 각 단계의 질문 개수는 아래 범위 내에서 내담자의 상황 복잡도에 따라 자유롭게 조절하세요:
+   - Step 1 (공감 형성): 2~5개
+   - Step 2 (문제 탐색): 3~7개
+   - Step 3 (사고 전환): 3~8개
+   - Step 4 (행동 계획): 2~5개
+   - Step 5 (마무리): 1~3개
+
+[출력 형식 - 반드시 아래 JSON만 출력. 다른 텍스트 금지]
 {{
-  "steps": [
-    {{
-      "step": 1,
-      "title": "단계 제목",
-      "goal": "이 단계의 목표",
-      "system_prompt": "이 단계에서 상담사 AI가 사용할 기본 지침 (한국어, 1~2문장). 반드시 '사용자 말에 먼저 공감한 뒤, 아래 질문을 하나씩 자연스럽게 이어가세요.' 문장으로 끝낼 것.",
-      "questions": [
-        "이 단계에서 물어볼 질문 1 (내담자 정보에 맞게 구체적으로)",
-        "질문 2",
-        "질문 3"
-      ]
+    "analysis": {{
+        "core_problem": "핵심 문제 한 줄 요약",
+        "cognitive_pattern": "예상되는 인지 왜곡 패턴명과 설명"
     }},
-    ...
-  ]
+    "steps": [
+        {{
+            "step": 1,
+            "name": "공감 형성",
+            "goal": "이 내담자의 상황에 맞는 구체적 목표",
+            "focus": "이 스텝에서 상담사가 집중할 포인트 (CBT 기법)",
+            "key_questions": ["내담자 상황에 맞는 질문들 (2~5개)"]
+        }},
+        {{
+            "step": 2,
+            "name": "문제 탐색",
+            "goal": "구체적 목표",
+            "focus": "5W1H로 사건 구체화 + 자동적 사고 식별",
+            "key_questions": ["내담자 상황에 맞는 질문들 (3~7개)"]
+        }},
+        {{
+            "step": 3,
+            "name": "사고 전환",
+            "goal": "구체적 목표",
+            "focus": "소크라테스식 질문으로 인지 왜곡 식별 및 도전",
+            "key_questions": ["내담자 상황에 맞는 소크라테스식 질문들 (3~8개)"]
+        }},
+        {{
+            "step": 4,
+            "name": "행동 계획",
+            "goal": "구체적 목표",
+            "focus": "균형잡힌 사고에 기반한 행동 실험 설계",
+            "key_questions": ["내담자 상황에 맞는 질문들 (2~5개)"]
+        }},
+        {{
+            "step": 5,
+            "name": "마무리",
+            "goal": "구체적 목표",
+            "focus": "통찰 정리 + 실천 다짐",
+            "key_questions": ["내담자 상황에 맞는 질문들 (1~3개)"]
+        }}
+    ]
 }}
-```
-
-## 규칙
-1. step 1은 반드시 '감정 탐색 및 공감' 단계로 시작
-2. step 5는 반드시 '정리 및 마무리' 단계로 끝냄
-3. 각 단계의 questions는 2~4개, 내담자 정보(주제/기분/내용)에 맞게 구체적으로 작성
-4. questions는 순서대로 진행되므로, 자연스럽게 깊어지는 흐름으로 작성
-5. 반드시 위 JSON 형식만 출력 (설명 텍스트 없이)
 """
 
-# API 실패 시 사용할 기본 폴백 플랜
-FALLBACK_PLAN: List[Dict[str, Any]] = [
-    {
-        "step": 1,
-        "title": "감정 탐색 및 공감",
-        "goal": "내담자의 현재 감정 상태를 파악하고 공감한다",
-        "system_prompt": (
-            "당신은 따뜻하고 공감적인 AI 심리상담사 '루나'입니다. "
-            "사용자 말에 먼저 공감한 뒤, 아래 질문을 하나씩 자연스럽게 이어가세요."
-        ),
-        "questions": [
-            "지금 가장 크게 느껴지는 감정이 무엇인가요?",
-            "그 감정이 언제부터, 어떤 상황에서 시작됐나요?",
-            "그 순간 몸에서 어떤 느낌이 들었는지 기억하세요?",
-        ],
+
+FALLBACK_PLAN: Dict[str, Any] = {
+    "analysis": {
+        "core_problem": "내담자의 호소를 충분히 파악하기 어려운 상황 (폴백 플랜)",
+        "cognitive_pattern": "감정적 추론(emotional reasoning) 가능성 — 감정을 사실로 받아들이는 패턴",
     },
-    {
-        "step": 2,
-        "title": "상황 분석",
-        "goal": "문제 상황의 구체적 맥락을 파악한다",
-        "system_prompt": (
-            "당신은 CBT 기반 AI 상담사 '루나'입니다. "
-            "사용자 말에 먼저 공감한 뒤, 아래 질문을 하나씩 자연스럽게 이어가세요."
-        ),
-        "questions": [
-            "그 상황에서 구체적으로 어떤 일이 있었나요?",
-            "그때 주변에 다른 사람이 있었나요? 그 상황을 어떻게 바라봤을 것 같으세요?",
-            "비슷한 상황이 전에도 있었나요?",
-        ],
-    },
-    {
-        "step": 3,
-        "title": "인지 탐색",
-        "goal": "자동적 사고와 인지 왜곡을 탐색한다",
-        "system_prompt": (
-            "당신은 CBT 전문 AI 상담사 '루나'입니다. "
-            "사용자 말에 먼저 공감한 뒤, 아래 질문을 하나씩 자연스럽게 이어가세요."
-        ),
-        "questions": [
-            "그 순간 머릿속에 어떤 생각이 스쳐 지나갔나요?",
-            "그 생각이 얼마나 사실이라고 느껴졌나요? 0~100점으로 표현한다면요?",
-            "혹시 그 생각이 항상 맞다고 느껴지나요, 아니면 상황에 따라 다른가요?",
-        ],
-    },
-    {
-        "step": 4,
-        "title": "대안적 사고 연습",
-        "goal": "균형 잡힌 대안적 사고를 연습한다",
-        "system_prompt": (
-            "당신은 CBT 기반 AI 상담사 '루나'입니다. "
-            "사용자 말에 먼저 공감한 뒤, 아래 질문을 하나씩 자연스럽게 이어가세요."
-        ),
-        "questions": [
-            "만약 친한 친구가 같은 상황이었다면, 뭐라고 말해줬을 것 같으세요?",
-            "그 생각 외에 상황을 다르게 볼 수 있는 방법이 있을까요?",
-            "새로운 시각으로 봤을 때 기분이 조금 달라지는 게 느껴지나요?",
-        ],
-    },
-    {
-        "step": 5,
-        "title": "정리 및 마무리",
-        "goal": "상담 내용을 정리하고 실천 과제를 제안한다",
-        "system_prompt": (
-            "당신은 CBT 기반 AI 상담사 '루나'입니다. "
-            "사용자 말에 먼저 공감한 뒤, 아래 질문을 하나씩 자연스럽게 이어가세요."
-        ),
-        "questions": [
-            "오늘 이야기하면서 새롭게 알게 된 것이 있다면 무엇인가요?",
-            "이번 주에 일상에서 작게 실천해볼 수 있는 것이 있을까요?",
-        ],
-    },
-]
+    "steps": [
+        {
+            "step": 1,
+            "name": "감정 탐색 및 공감",
+            "goal": "현재 감정과 그 강도, 신체 반응을 파악하고 안전한 분위기 형성",
+            "focus": "판단 없이 감정에 라벨을 붙이고 공감, 감정의 정당성 확인",
+            "key_questions": [
+                "지금 가장 크게 느껴지는 감정이 무엇인가요?",
+                "그 감정이 언제부터, 어떤 상황에서 시작됐나요?",
+                "그 순간 몸에서 어떤 느낌이 들었는지 기억나시나요?",
+            ],
+        },
+        {
+            "step": 2,
+            "name": "문제 탐색",
+            "goal": "구체적 사건 맥락 파악 + 자동적 사고 식별",
+            "focus": "5W1H로 사건 구체화, '그때 어떤 생각이 스쳤나요?'로 자동적 사고 노출",
+            "key_questions": [
+                "그 상황에서 구체적으로 어떤 일이 있었나요?",
+                "그때 머릿속에 어떤 생각이 가장 먼저 떠올랐나요?",
+                "그 생각이 사실이라는 증거는 무엇이었나요?",
+            ],
+        },
+        {
+            "step": 3,
+            "name": "사고 전환",
+            "goal": "소크라테스식 질문으로 인지 왜곡 식별 및 도전",
+            "focus": "근거 검토, 대안적 관점, 친구라면 뭐라고 할지 등 소크라테스식 질문",
+            "key_questions": [
+                "그 생각이 100% 사실이라고 확신하나요? 0~100점으로 표현한다면요?",
+                "그 생각과 반대되는 증거는 없을까요?",
+                "친한 친구가 같은 상황이라면, 뭐라고 말해줄 것 같으세요?",
+            ],
+        },
+        {
+            "step": 4,
+            "name": "행동 계획",
+            "goal": "균형잡힌 사고에 기반한 작은 행동 실험 설계",
+            "focus": "구체적이고 실현 가능한 행동, 행동 실험으로 사고 검증",
+            "key_questions": [
+                "새로운 시각으로 봤을 때, 이번 주에 시도해볼 수 있는 작은 행동이 있을까요?",
+                "그 행동을 가로막는 것이 있다면 무엇일까요?",
+                "결과가 어떻게 나올지 예상해보면, 어떤 모습일까요?",
+            ],
+        },
+        {
+            "step": 5,
+            "name": "마무리",
+            "goal": "통찰 정리 + 실천 다짐",
+            "focus": "오늘 발견한 인지 왜곡과 대안적 사고 요약, 다음까지의 과제",
+            "key_questions": [
+                "오늘 이야기하면서 가장 새롭게 느낀 점은 무엇인가요?",
+                "이번 주 동안 어떤 점을 기억하면 도움이 될까요?",
+            ],
+        },
+    ],
+}
 
 
 class DynamicPlanGenerator:
-    """GPT-4o-mini API를 호출하여 내담자 맞춤 5-step CBT 플랜을 생성."""
+    """GPT-4o-mini로 내담자 맞춤 5-step CBT 플랜 + 인지 왜곡 분석 생성."""
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or settings.openai_api_key
 
-    def generate(self, topic: str, mood: str, content: str) -> List[Dict[str, Any]]:
+    def generate(self, topic: str, mood: str, content: str) -> Dict[str, Any]:
         """
-        5-step 플랜 생성. API 실패 시 폴백 플랜 반환.
+        반환: {"analysis": {core_problem, cognitive_pattern}, "steps": [...]}
+        실패 시 FALLBACK_PLAN 반환.
         동기 함수 — pipeline에서 run_in_executor로 호출할 것.
         """
         if not self.api_key:
@@ -149,20 +171,22 @@ class DynamicPlanGenerator:
             logger.warning("[PlanGen] API 호출 실패 → 폴백 플랜 사용")
             return FALLBACK_PLAN
 
-        steps = self._parse_plan(raw)
-        if steps is None:
+        plan = self._parse_plan(raw)
+        if plan is None:
             logger.warning("[PlanGen] JSON 파싱 실패 → 폴백 플랜 사용")
             return FALLBACK_PLAN
 
         elapsed = time.time() - t0
-        logger.info(f"[PlanGen] 플랜 생성 완료 ({elapsed:.2f}초, {len(steps)}단계)")
-        for s in steps:
-            logger.info(f"  Step {s['step']}: {s['title']} ({len(s.get('questions', []))}개 질문)")
+        analysis = plan.get("analysis", {})
+        logger.info(f"[PlanGen] 플랜 생성 완료 ({elapsed:.2f}초)")
+        logger.info(f"  핵심 문제: {analysis.get('core_problem', '?')}")
+        logger.info(f"  인지 왜곡: {analysis.get('cognitive_pattern', '?')}")
+        for s in plan.get("steps", []):
+            logger.info(f"  Step {s['step']} {s['name']}: {len(s.get('key_questions', []))}개 질문")
 
-        return steps
+        return plan
 
     def _call_api(self, prompt: str) -> Optional[str]:
-        """OpenAI Chat Completions API 호출. 실패 시 None 반환."""
         try:
             from openai import OpenAI
 
@@ -174,17 +198,16 @@ class DynamicPlanGenerator:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.7,
-                max_tokens=1500,
+                max_tokens=2000,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"[PlanGen] OpenAI API 오류: {e}")
             return None
 
-    def _parse_plan(self, raw: str) -> Optional[List[Dict[str, Any]]]:
-        """GPT 응답 JSON 파싱. 실패 시 None 반환."""
+    def _parse_plan(self, raw: str) -> Optional[Dict[str, Any]]:
+        """새 스키마(analysis + steps) 검증."""
         try:
-            # ```json ... ``` 블록 제거
             text = raw.strip()
             if text.startswith("```"):
                 lines = text.split("\n")
@@ -192,23 +215,31 @@ class DynamicPlanGenerator:
                 text = "\n".join(lines)
 
             data = json.loads(text)
-            steps = data.get("steps", data) if isinstance(data, dict) else data
-
-            if not isinstance(steps, list) or len(steps) != 5:
-                logger.warning(f"[PlanGen] 플랜 단계 수 불일치: {len(steps) if isinstance(steps, list) else 'not list'}")
+            if not isinstance(data, dict):
+                logger.warning("[PlanGen] 최상위가 dict가 아님")
                 return None
 
-            # 필수 필드 검증
+            analysis = data.get("analysis")
+            steps = data.get("steps")
+
+            if not isinstance(analysis, dict) or "core_problem" not in analysis or "cognitive_pattern" not in analysis:
+                logger.warning("[PlanGen] analysis 필드 누락 또는 형식 오류")
+                return None
+
+            if not isinstance(steps, list) or len(steps) != 5:
+                logger.warning(f"[PlanGen] steps 5개 아님: {len(steps) if isinstance(steps, list) else 'not list'}")
+                return None
+
             for s in steps:
-                for key in ("step", "title", "goal", "system_prompt", "questions"):
+                for key in ("step", "name", "goal", "focus", "key_questions"):
                     if key not in s:
                         logger.warning(f"[PlanGen] Step {s.get('step', '?')}에 '{key}' 필드 누락")
                         return None
-                if not isinstance(s["questions"], list) or len(s["questions"]) < 1:
-                    logger.warning(f"[PlanGen] Step {s.get('step', '?')} questions 형식 오류")
+                if not isinstance(s["key_questions"], list) or len(s["key_questions"]) < 1:
+                    logger.warning(f"[PlanGen] Step {s.get('step', '?')} key_questions 형식 오류")
                     return None
 
-            return steps
+            return data
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.error(f"[PlanGen] JSON 파싱 오류: {e}")
             return None

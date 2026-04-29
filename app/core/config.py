@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     cbt_adapter_path: str = "models/cbt-counselor-final"
     cbt_lora_dir: str = "models/lora"
 
-    # 텍스트 감정 설정 (klue/bert)
+    # 텍스트 감정 설정 (klue/bert) — fp16 GPU 사용 시 ~200MB
     text_emotion_model_path: str = "models/text-emotion-final"
-    text_emotion_device: str = "cpu"
+    text_emotion_device: str = "cuda"
 
     # 음성 감정 설정 (wav2vec2)
     audio_emotion_device: str = "cpu"
